@@ -235,6 +235,47 @@ def word_wrap_segments(text, width):
     return segs
 
 
+def word_wrap_line(text, width, cursor=None):
+    """Word-wrap a single line. Returns (lines, cur_row, cur_col).
+
+    `lines` is a list of segment strings (at least one). When `cursor` is None,
+    cur_row/cur_col are 0. Otherwise they give the display position of the
+    cursor, mirroring the editor's layout() logic (including a parking row when
+    the cursor sits just past the right edge of a full-width segment)."""
+    avail = max(1, width)
+    if not text:
+        return [""], 0, 0
+    segs = word_wrap_segments(text, avail)
+    lines = [t for _s, _e, t in segs]
+    if cursor is None:
+        return lines, 0, 0
+
+    cur_row = 0
+    cur_col = 0
+    for k, (off, _e, t) in enumerate(segs):
+        seg_end = off + len(t)
+        if off <= cursor < seg_end:
+            cur_row = k
+            cur_col = cursor - off
+            break
+        if cursor == seg_end:
+            if k + 1 < len(segs) and segs[k + 1][0] == cursor:
+                continue
+            cur_row = k
+            cur_col = cursor - off
+            break
+    else:
+        cur_row = len(segs) - 1
+        cur_col = cursor - segs[-1][0]
+
+    if cur_col == len(lines[cur_row]) == avail and cur_row == len(lines) - 1:
+        lines.append("")
+        cur_row += 1
+        cur_col = 0
+
+    return lines, cur_row, cur_col
+
+
 def delete_word_back(buf, cursor):
     """Mutate buf list in place; return new cursor position."""
     if cursor == 0:
@@ -449,8 +490,13 @@ def edit_notes(stdscr, title, initial_text):
 # --- Main view ---
 
 def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
-    """Return list of row dicts: {'kind', 'task_idx', 'text', 'attr'}."""
+    """Return (rows, rename_pos).
+
+    rows is a list of row dicts: {'kind', 'task_idx', 'text', 'attr'}.
+    rename_pos is (row_offset, col) of the rename cursor relative to the first
+    row of the renamed task, or None when not renaming."""
     rows = []
+    rename_pos = None
     split_idx = next(
         (i for i, t in enumerate(tasks) if t[3] == 1), len(tasks)
     )
@@ -463,10 +509,13 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
             title = rename_text
         checkbox = "[x]" if done else "[ ]"
         marker = "·" if notes else " "
-        title_lines = hard_wrap(title, avail)
-        if rename_idx == i and rename_cursor > 0 \
-                and rename_cursor == len(title) and rename_cursor % avail == 0:
-            title_lines.append("")
+        if rename_idx == i and rename_text is not None:
+            title_lines, cur_row, cur_col = word_wrap_line(
+                title, avail, rename_cursor
+            )
+            rename_pos = (cur_row, TASK_PREFIX_LEN + cur_col)
+        else:
+            title_lines, _cr, _cc = word_wrap_line(title, avail)
         for j, line in enumerate(title_lines):
             if j == 0:
                 prefix = " " + checkbox + " " + marker + " "
@@ -481,7 +530,7 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
                     "attr": attr,
                 }
             )
-    return rows
+    return rows, rename_pos
 
 
 def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
@@ -521,7 +570,7 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
     # --- Tasks ---
     rename_idx = (selected - 1) if (renaming and selected > 0) else None
     rename_text = "".join(rename_buf) if renaming else None
-    rows = build_render(
+    rows, rename_pos = build_render(
         tasks, w,
         rename_idx=rename_idx,
         rename_text=rename_text,
@@ -595,10 +644,8 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         c_col = prefix_len + (input_cursor % avail_input)
         c_line = min(c_line, max_input_rows - 1)
         cursor_pos = (c_line, min(c_col, w - 1))
-    elif renaming and sel_screen_first_row is not None:
-        avail_task = max(1, w - TASK_PREFIX_LEN)
-        c_line = rename_cursor // avail_task
-        c_col = TASK_PREFIX_LEN + (rename_cursor % avail_task)
+    elif renaming and sel_screen_first_row is not None and rename_pos is not None:
+        c_line, c_col = rename_pos
         cursor_pos = (sel_screen_first_row + c_line, min(c_col, w - 1))
 
     if cursor_pos is not None:
