@@ -20,6 +20,8 @@ HELP_TASK_BAR = (
 )
 HELP_RENAME_BAR = " type · ⏎/esc save · ⌃w word "
 HELP_NOTES = " ⏎ newline · esc save & close "
+HELP_NOTEPAD_BAR = " ⏎ edit · ↑ tasks · q quit "
+HELP_NOTEPAD_EDIT_BAR = " ⏎ newline · esc save · ⌃w word "
 
 INPUT_PREFIX = " + "
 INPUT_INDENT = "   "
@@ -27,6 +29,16 @@ INPUT_PLACEHOLDER = "New task..."
 
 TASK_PREFIX_LEN = 7  # " [x] · "
 TASK_INDENT = " " * TASK_PREFIX_LEN
+
+NOTEPAD_HEIGHT = 5  # visible content rows in the notepad pane
+NOTEPAD_PREFIX_LEN = 1  # one-space left margin for notepad content
+NOTEPAD_LABEL = " notes "
+NOTEPAD_PLACEHOLDER = "notes…"
+
+HEADER_ROWS = 1  # the "todo" heading occupies the top row
+TODO_LABEL = " todo "
+HEADING_ACTIVE_LEAD = "──▶"  # heading lead-in for the focused panel
+HEADING_PLAIN_LEAD = "──"  # heading lead-in for an unfocused panel
 
 F2_KEY = curses.KEY_F0 + 2
 CTRL_W = "\x17"
@@ -53,7 +65,31 @@ def db_connect():
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN done INTEGER NOT NULL DEFAULT 0"
             )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
     return conn
+
+
+def get_notepad(conn):
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key='notepad'"
+    ).fetchone()
+    return row[0] if row else ""
+
+
+def set_notepad(conn, text):
+    with conn:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('notepad', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (text,),
+        )
 
 
 def list_tasks(conn):
@@ -302,91 +338,194 @@ def read_alt_modifier(stdscr):
     return nxt
 
 
+# --- Text editor core ---
+#
+# A small word-wrapping multi-line editor shared by the full-screen task-notes
+# modal (edit_notes) and the inline notepad pane on the main view. State lives
+# in a TextBuffer; layout and key handling are free functions so a caller can
+# mount the editor in any rectangle it owns and drive its own draw loop.
+
+class TextBuffer:
+    """Mutable multi-line text + cursor (cy, cx) + display scroll (scroll_y)."""
+
+    def __init__(self, text=""):
+        self.lines = text.split("\n") if text else [""]
+        if not self.lines:
+            self.lines = [""]
+        self.cy = 0
+        self.cx = 0
+        self.scroll_y = 0
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def editor_layout(lines, cy, cx, width):
+    """Word-wrap each logical line. Return (display_rows, cur_row, cur_col).
+    display_rows is a list of (logical_idx, char_offset, text)."""
+    avail = max(1, width)
+    rows = []
+    for li, line in enumerate(lines):
+        if not line:
+            rows.append((li, 0, ""))
+            continue
+        for s, _e, text in word_wrap_segments(line, avail):
+            rows.append((li, s, text))
+
+    # Locate cursor among the rows belonging to logical line cy.
+    cy_row_indices = [ri for ri, (li, _o, _t) in enumerate(rows) if li == cy]
+    cur_row = cy_row_indices[0] if cy_row_indices else 0
+    cur_col = 0
+    for k, ri in enumerate(cy_row_indices):
+        _li, off, text = rows[ri]
+        seg_end = off + len(text)
+        if off <= cx < seg_end:
+            cur_row = ri
+            cur_col = cx - off
+            break
+        if cx == seg_end:
+            # End of this segment. If the next row in this line starts at the
+            # same position, there's no eaten space — cursor goes there.
+            # Otherwise (eaten space, or last row), cursor sits at line end.
+            if k + 1 < len(cy_row_indices):
+                next_off = rows[cy_row_indices[k + 1]][1]
+                if next_off == cx:
+                    continue
+            cur_row = ri
+            cur_col = cx - off
+            break
+    else:
+        # Cursor at end-of-line (shouldn't normally fall through but be safe).
+        if cy_row_indices:
+            ri = cy_row_indices[-1]
+            _li, off, _t = rows[ri]
+            cur_row = ri
+            cur_col = cx - off
+
+    # Parking row: cursor visually past the right edge of a full-width row.
+    cur_row_text = rows[cur_row][2] if rows else ""
+    if cur_col == len(cur_row_text) == avail:
+        is_last_of_li = (
+            cur_row == len(rows) - 1 or rows[cur_row + 1][0] != cy
+        )
+        if is_last_of_li:
+            rows.insert(cur_row + 1, (cy, cx, ""))
+            cur_row += 1
+            cur_col = 0
+
+    return rows, cur_row, cur_col
+
+
+def editor_scroll(buf, display_rows, cur_row, view_h):
+    """Adjust buf.scroll_y so cur_row stays visible within view_h rows."""
+    if cur_row < buf.scroll_y:
+        buf.scroll_y = cur_row
+    elif cur_row >= buf.scroll_y + view_h:
+        buf.scroll_y = cur_row - view_h + 1
+    buf.scroll_y = max(0, min(buf.scroll_y, max(0, len(display_rows) - view_h)))
+
+
+def editor_word_delete_back(buf):
+    """Delete the word before the cursor (or merge into the previous line)."""
+    lines = buf.lines
+    if buf.cx == 0:
+        if buf.cy > 0:
+            prev = lines[buf.cy - 1]
+            lines[buf.cy - 1] = prev + lines[buf.cy]
+            del lines[buf.cy]
+            buf.cy -= 1
+            buf.cx = len(prev)
+        return
+    line = lines[buf.cy]
+    new_cx = buf.cx
+    while new_cx > 0 and line[new_cx - 1] == " ":
+        new_cx -= 1
+    while new_cx > 0 and line[new_cx - 1] != " ":
+        new_cx -= 1
+    lines[buf.cy] = line[:new_cx] + line[buf.cx:]
+    buf.cx = new_cx
+
+
+def editor_handle_key(buf, ch, width):
+    """Apply one content/navigation keystroke to buf at the given wrap width.
+
+    Handles printable input, arrows, Home/End, Backspace, Delete, newline and
+    Ctrl-W. Returns True if the key was consumed. Callers own Esc / Ctrl-C and
+    the Alt-Backspace (Esc-then-Backspace) word delete, since what "leaving the
+    editor" means differs per mount."""
+    lines = buf.lines
+    if ch == CTRL_W:
+        editor_word_delete_back(buf)
+    elif ch == curses.KEY_UP:
+        rows, cur_row, cur_col = editor_layout(lines, buf.cy, buf.cx, width)
+        if cur_row > 0:
+            tli, toff, ttext = rows[cur_row - 1]
+            buf.cy = tli
+            buf.cx = toff + min(cur_col, len(ttext))
+    elif ch == curses.KEY_DOWN:
+        rows, cur_row, cur_col = editor_layout(lines, buf.cy, buf.cx, width)
+        if cur_row < len(rows) - 1:
+            tli, toff, ttext = rows[cur_row + 1]
+            buf.cy = tli
+            buf.cx = toff + min(cur_col, len(ttext))
+    elif ch == curses.KEY_LEFT:
+        if buf.cx > 0:
+            buf.cx -= 1
+        elif buf.cy > 0:
+            buf.cy -= 1
+            buf.cx = len(lines[buf.cy])
+    elif ch == curses.KEY_RIGHT:
+        if buf.cx < len(lines[buf.cy]):
+            buf.cx += 1
+        elif buf.cy < len(lines) - 1:
+            buf.cy += 1
+            buf.cx = 0
+    elif ch == curses.KEY_HOME:
+        buf.cx = 0
+    elif ch == curses.KEY_END:
+        buf.cx = len(lines[buf.cy])
+    elif is_backspace(ch):
+        if buf.cx > 0:
+            lines[buf.cy] = lines[buf.cy][: buf.cx - 1] + lines[buf.cy][buf.cx:]
+            buf.cx -= 1
+        elif buf.cy > 0:
+            prev = lines[buf.cy - 1]
+            lines[buf.cy - 1] = prev + lines[buf.cy]
+            del lines[buf.cy]
+            buf.cy -= 1
+            buf.cx = len(prev)
+    elif ch == curses.KEY_DC:
+        if buf.cx < len(lines[buf.cy]):
+            lines[buf.cy] = lines[buf.cy][: buf.cx] + lines[buf.cy][buf.cx + 1:]
+        elif buf.cy < len(lines) - 1:
+            lines[buf.cy] = lines[buf.cy] + lines[buf.cy + 1]
+            del lines[buf.cy + 1]
+    elif ch == "\n" or ch == "\r":
+        tail = lines[buf.cy][buf.cx:]
+        lines[buf.cy] = lines[buf.cy][: buf.cx]
+        lines.insert(buf.cy + 1, tail)
+        buf.cy += 1
+        buf.cx = 0
+    elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+        lines[buf.cy] = lines[buf.cy][: buf.cx] + ch + lines[buf.cy][buf.cx:]
+        buf.cx += 1
+    else:
+        return False
+    return True
+
+
 # --- Notes editor ---
 
 def edit_notes(stdscr, title, initial_text):
-    """Returns the edited text. Esc always saves. None only if nothing changed."""
+    """Full-screen editor for a task's notes. Esc/Ctrl-C save & close.
+    Returns the edited text, or None if nothing changed."""
     original = initial_text
-    lines = initial_text.split("\n") if initial_text else [""]
-    if not lines:
-        lines = [""]
-    cy, cx = 0, 0
-    scroll_y = 0  # in display rows
+    buf = TextBuffer(initial_text)
     set_cursor(True)
 
-    def word_delete_back():
-        nonlocal cy, cx
-        if cx == 0:
-            if cy > 0:
-                prev = lines[cy - 1]
-                lines[cy - 1] = prev + lines[cy]
-                del lines[cy]
-                cy -= 1
-                cx = len(prev)
-            return
-        line = lines[cy]
-        new_cx = cx
-        while new_cx > 0 and line[new_cx - 1] == " ":
-            new_cx -= 1
-        while new_cx > 0 and line[new_cx - 1] != " ":
-            new_cx -= 1
-        lines[cy] = line[:new_cx] + line[cx:]
-        cx = new_cx
-
-    def layout(width):
-        """Word-wrap each logical line. Return (display_rows, cur_row, cur_col).
-        display_rows is a list of (logical_idx, char_offset, text)."""
-        avail = max(1, width)
-        rows = []
-        for li, line in enumerate(lines):
-            if not line:
-                rows.append((li, 0, ""))
-                continue
-            for s, _e, text in word_wrap_segments(line, avail):
-                rows.append((li, s, text))
-
-        # Locate cursor among the rows belonging to logical line cy.
-        cy_row_indices = [ri for ri, (li, _o, _t) in enumerate(rows) if li == cy]
-        cur_row = cy_row_indices[0] if cy_row_indices else 0
-        cur_col = 0
-        for k, ri in enumerate(cy_row_indices):
-            _li, off, text = rows[ri]
-            seg_end = off + len(text)
-            if off <= cx < seg_end:
-                cur_row = ri
-                cur_col = cx - off
-                break
-            if cx == seg_end:
-                # End of this segment. If the next row in this line starts at
-                # the same position, there's no eaten space — cursor goes there.
-                # Otherwise (eaten space, or last row), cursor sits at line end.
-                if k + 1 < len(cy_row_indices):
-                    next_off = rows[cy_row_indices[k + 1]][1]
-                    if next_off == cx:
-                        continue
-                cur_row = ri
-                cur_col = cx - off
-                break
-        else:
-            # Cursor at end-of-line (shouldn't normally fall through but be safe).
-            if cy_row_indices:
-                ri = cy_row_indices[-1]
-                _li, off, _t = rows[ri]
-                cur_row = ri
-                cur_col = cx - off
-
-        # Parking row: cursor visually past the right edge of a full-width row.
-        cur_row_text = rows[cur_row][2] if rows else ""
-        if cur_col == len(cur_row_text) == avail:
-            is_last_of_li = (
-                cur_row == len(rows) - 1 or rows[cur_row + 1][0] != cy
-            )
-            if is_last_of_li:
-                rows.insert(cur_row + 1, (cy, cx, ""))
-                cur_row += 1
-                cur_col = 0
-
-        return rows, cur_row, cur_col
+    def result():
+        return None if buf.text == original else buf.text
 
     try:
         while True:
@@ -394,16 +533,14 @@ def edit_notes(stdscr, title, initial_text):
             stdscr.erase()
             fill_line(stdscr, 0, 0, w, " notes — " + title + " ", curses.A_REVERSE)
 
-            display_rows, cur_row, cur_col = layout(w)
+            display_rows, cur_row, cur_col = editor_layout(
+                buf.lines, buf.cy, buf.cx, w
+            )
             edit_h = max(1, h - 2)
-            if cur_row < scroll_y:
-                scroll_y = cur_row
-            elif cur_row >= scroll_y + edit_h:
-                scroll_y = cur_row - edit_h + 1
-            scroll_y = max(0, min(scroll_y, max(0, len(display_rows) - edit_h)))
+            editor_scroll(buf, display_rows, cur_row, edit_h)
 
             for i in range(edit_h):
-                ri = scroll_y + i
+                ri = buf.scroll_y + i
                 if ri >= len(display_rows):
                     break
                 _, _, text = display_rows[ri]
@@ -411,83 +548,37 @@ def edit_notes(stdscr, title, initial_text):
 
             fill_line(stdscr, h - 1, 0, w - 1, HELP_NOTES, curses.A_REVERSE)
             try:
-                stdscr.move(1 + (cur_row - scroll_y), min(cur_col, w - 1))
+                stdscr.move(1 + (cur_row - buf.scroll_y), min(cur_col, w - 1))
             except curses.error:
                 pass
             stdscr.refresh()
 
             ch = stdscr.get_wch()
             if ch == "\x03":
-                new_text = "\n".join(lines)
-                return None if new_text == original else new_text
+                return result()
             if ch == "\x1b":
                 nxt = read_alt_modifier(stdscr)
                 if nxt is None:
-                    new_text = "\n".join(lines)
-                    return None if new_text == original else new_text
+                    return result()
                 if is_backspace(nxt):
-                    word_delete_back()
+                    editor_word_delete_back(buf)
                 continue
-            if ch == CTRL_W:
-                word_delete_back()
-            elif ch == curses.KEY_UP:
-                if cur_row > 0:
-                    tli, toff, ttext = display_rows[cur_row - 1]
-                    cy = tli
-                    cx = toff + min(cur_col, len(ttext))
-            elif ch == curses.KEY_DOWN:
-                if cur_row < len(display_rows) - 1:
-                    tli, toff, ttext = display_rows[cur_row + 1]
-                    cy = tli
-                    cx = toff + min(cur_col, len(ttext))
-            elif ch == curses.KEY_LEFT:
-                if cx > 0:
-                    cx -= 1
-                elif cy > 0:
-                    cy -= 1
-                    cx = len(lines[cy])
-            elif ch == curses.KEY_RIGHT:
-                if cx < len(lines[cy]):
-                    cx += 1
-                elif cy < len(lines) - 1:
-                    cy += 1
-                    cx = 0
-            elif ch == curses.KEY_HOME:
-                cx = 0
-            elif ch == curses.KEY_END:
-                cx = len(lines[cy])
-            elif is_backspace(ch):
-                if cx > 0:
-                    lines[cy] = lines[cy][: cx - 1] + lines[cy][cx:]
-                    cx -= 1
-                elif cy > 0:
-                    prev = lines[cy - 1]
-                    lines[cy - 1] = prev + lines[cy]
-                    del lines[cy]
-                    cy -= 1
-                    cx = len(prev)
-            elif ch == curses.KEY_DC:
-                if cx < len(lines[cy]):
-                    lines[cy] = lines[cy][:cx] + lines[cy][cx + 1 :]
-                elif cy < len(lines) - 1:
-                    lines[cy] = lines[cy] + lines[cy + 1]
-                    del lines[cy + 1]
-            elif ch == "\n" or ch == "\r":
-                tail = lines[cy][cx:]
-                lines[cy] = lines[cy][:cx]
-                lines.insert(cy + 1, tail)
-                cy += 1
-                cx = 0
-            elif ch == curses.KEY_RESIZE:
-                pass
-            elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
-                lines[cy] = lines[cy][:cx] + ch + lines[cy][cx:]
-                cx += 1
+            if ch == curses.KEY_RESIZE:
+                continue
+            editor_handle_key(buf, ch, w)
     finally:
         set_cursor(False)
 
 
 # --- Main view ---
+
+def heading_bar(label, w, active):
+    """Build a full-width section heading like '──▶ todo ───────'.
+    The focused panel gets an arrow lead-in; otherwise a plain rule."""
+    lead = HEADING_ACTIVE_LEAD if active else HEADING_PLAIN_LEAD
+    text = lead + label
+    return (text + "─" * max(0, w - len(text)))[:w]
+
 
 def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
     """Return (rows, rename_pos).
@@ -534,14 +625,22 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
 
 
 def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
-                renaming, rename_buf, rename_cursor):
+                renaming, rename_buf, rename_cursor,
+                notepad, notepad_focused, notepad_editing):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
-    input_focused = (selected == 0) and not renaming
+    input_focused = (selected == 0) and not renaming and not notepad_focused
+    todo_active = not notepad_focused
     prefix_len = len(INPUT_PREFIX)
     avail_input = max(1, w - prefix_len)
     input_text = "".join(input_buf)
+
+    # --- "todo" heading ---
+    safe_addstr(
+        stdscr, 0, 0, heading_bar(TODO_LABEL, w, todo_active),
+        curses.A_BOLD if todo_active else curses.A_DIM,
+    )
 
     # --- Input field ---
     if input_focused:
@@ -558,14 +657,26 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         else:
             input_lines = [INPUT_PLACEHOLDER]
 
-    max_input_rows = max(1, h - 2)
+    max_input_rows = max(1, h - HEADER_ROWS - 2)
     input_lines = input_lines[:max_input_rows]
     input_rows = len(input_lines)
 
     for i, line in enumerate(input_lines):
         p = INPUT_PREFIX if i == 0 else INPUT_INDENT
         attr = curses.A_NORMAL if input_focused else curses.A_DIM
-        fill_line(stdscr, i, 0, w, p + line, attr)
+        fill_line(stdscr, HEADER_ROWS + i, 0, w, p + line, attr)
+
+    # --- Geometry: reserve a notepad pane at the bottom when it fits ---
+    sep_row = h - NOTEPAD_HEIGHT - 2
+    task_area_start = HEADER_ROWS + input_rows
+    notepad_visible = sep_row - task_area_start >= 1
+    if notepad_visible:
+        task_area_end = sep_row
+        pad_content_start = sep_row + 1
+    else:
+        task_area_end = h - 1
+        pad_content_start = None
+    task_area_h = max(1, task_area_end - task_area_start)
 
     # --- Tasks ---
     rename_idx = (selected - 1) if (renaming and selected > 0) else None
@@ -576,10 +687,6 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         rename_text=rename_text,
         rename_cursor=rename_cursor if renaming else 0,
     )
-
-    task_area_start = input_rows
-    task_area_end = h - 1
-    task_area_h = max(1, task_area_end - task_area_start)
 
     if selected > 0:
         sel_first = sel_last = None
@@ -602,7 +709,10 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
             break
         r = rows[ri]
         attr = r["attr"]
-        if (
+        if notepad_focused:
+            # Todo panel inactive: dim but keep readable, no selection bar.
+            attr = curses.A_DIM
+        elif (
             r["kind"] == "task"
             and r["task_idx"] == (selected - 1)
             and selected > 0
@@ -628,9 +738,54 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 curses.A_DIM,
             )
 
+    # --- Notepad pane ---
+    pad_cursor = None
+    if notepad_visible:
+        safe_addstr(
+            stdscr, sep_row, 0, heading_bar(NOTEPAD_LABEL, w, notepad_focused),
+            curses.A_BOLD if notepad_focused else curses.A_DIM,
+        )
+
+        content_attr = curses.A_NORMAL if notepad_focused else curses.A_DIM
+        pad_width = max(1, w - NOTEPAD_PREFIX_LEN)
+        if notepad.text == "" and not notepad_editing:
+            safe_addstr(
+                stdscr, pad_content_start, NOTEPAD_PREFIX_LEN,
+                NOTEPAD_PLACEHOLDER, curses.A_DIM,
+            )
+        else:
+            display_rows, cur_row, cur_col = editor_layout(
+                notepad.lines, notepad.cy, notepad.cx, pad_width
+            )
+            if notepad_editing:
+                editor_scroll(notepad, display_rows, cur_row, NOTEPAD_HEIGHT)
+            else:
+                notepad.scroll_y = max(
+                    0,
+                    min(notepad.scroll_y,
+                        max(0, len(display_rows) - NOTEPAD_HEIGHT)),
+                )
+            for i in range(NOTEPAD_HEIGHT):
+                ri = notepad.scroll_y + i
+                if ri >= len(display_rows):
+                    break
+                text = display_rows[ri][2]
+                fill_line(
+                    stdscr, pad_content_start + i, 0, w,
+                    " " * NOTEPAD_PREFIX_LEN + text, content_attr,
+                )
+            if notepad_editing:
+                cr = pad_content_start + (cur_row - notepad.scroll_y)
+                cc = NOTEPAD_PREFIX_LEN + cur_col
+                pad_cursor = (cr, min(cc, w - 1))
+
     # --- Help bar ---
     if renaming:
         help_text = HELP_RENAME_BAR
+    elif notepad_editing:
+        help_text = HELP_NOTEPAD_EDIT_BAR
+    elif notepad_focused:
+        help_text = HELP_NOTEPAD_BAR
     elif input_focused:
         help_text = HELP_INPUT_BAR
     else:
@@ -643,10 +798,12 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         c_line = input_cursor // avail_input
         c_col = prefix_len + (input_cursor % avail_input)
         c_line = min(c_line, max_input_rows - 1)
-        cursor_pos = (c_line, min(c_col, w - 1))
+        cursor_pos = (HEADER_ROWS + c_line, min(c_col, w - 1))
     elif renaming and sel_screen_first_row is not None and rename_pos is not None:
         c_line, c_col = rename_pos
         cursor_pos = (sel_screen_first_row + c_line, min(c_col, w - 1))
+    elif notepad_editing and pad_cursor is not None:
+        cursor_pos = pad_cursor
 
     if cursor_pos is not None:
         try:
@@ -656,7 +813,7 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
     set_cursor(cursor_pos is not None)
     stdscr.refresh()
 
-    return scroll
+    return scroll, notepad_visible
 
 
 def run(stdscr):
@@ -677,6 +834,14 @@ def run(stdscr):
     rename_buf = []
     rename_cursor = 0
     rename_target_id = None
+
+    notepad = TextBuffer(get_notepad(conn))
+    notepad_focused = False
+    notepad_editing = False
+    notepad_visible = False
+
+    def save_notepad():
+        set_notepad(conn, notepad.text)
 
     undo_stack = []
 
@@ -714,11 +879,15 @@ def run(stdscr):
             max_sel = len(tasks)
             selected = max(0, min(selected, max_sel))
 
-            scroll = render_main(
+            scroll, notepad_visible = render_main(
                 stdscr, tasks, selected, scroll,
                 input_buf, input_cursor,
                 renaming, rename_buf, rename_cursor,
+                notepad, notepad_focused, notepad_editing,
             )
+            if not notepad_visible and notepad_focused:
+                notepad_focused = False
+                notepad_editing = False
 
             ch = stdscr.get_wch()
 
@@ -762,6 +931,41 @@ def run(stdscr):
                 # any other key ignored
                 continue
 
+            # --- NOTEPAD MODE ---
+            if notepad_focused:
+                pad_width = max(1, w - NOTEPAD_PREFIX_LEN)
+                if notepad_editing:
+                    if ch == "\x03":
+                        save_notepad()
+                        break
+                    if ch == "\x1b":
+                        nxt = read_alt_modifier(stdscr)
+                        if nxt is None:
+                            save_notepad()
+                            notepad_editing = False
+                        elif is_backspace(nxt):
+                            editor_word_delete_back(notepad)
+                        continue
+                    if ch == curses.KEY_RESIZE:
+                        continue
+                    editor_handle_key(notepad, ch, pad_width)
+                    continue
+                # idle: focused but not editing
+                if ch == "\x03" or ch == "q" or ch == "Q":
+                    break
+                if ch == "\n" or ch == "\r":
+                    notepad_editing = True
+                elif ch == curses.KEY_UP:
+                    notepad_focused = False
+                    selected = len(tasks) if tasks else 0
+                elif ch == curses.KEY_HOME:
+                    notepad_focused = False
+                    selected = 0
+                elif ch == curses.KEY_RESIZE:
+                    pass
+                # any other key ignored
+                continue
+
             if ch == "\x03":
                 break
 
@@ -780,6 +984,8 @@ def run(stdscr):
                     else:
                         if tasks:
                             selected = 1
+                        elif notepad_visible:
+                            notepad_focused = True
                 elif ch == curses.KEY_UP:
                     if input_cursor >= avail_input:
                         input_cursor -= avail_input
@@ -840,7 +1046,10 @@ def run(stdscr):
                 elif ch == curses.KEY_UP:
                     selected = max(0, selected - 1)
                 elif ch == curses.KEY_DOWN:
-                    selected = min(max_sel, selected + 1)
+                    if selected == max_sel and notepad_visible:
+                        notepad_focused = True
+                    else:
+                        selected = min(max_sel, selected + 1)
                 elif ch == curses.KEY_HOME:
                     selected = 0
                 elif ch == curses.KEY_END:
