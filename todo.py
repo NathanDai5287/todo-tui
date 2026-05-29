@@ -325,17 +325,75 @@ def delete_word_back(buf, cursor):
     return new_cursor
 
 
-def read_alt_modifier(stdscr):
-    """Peek for an immediately-following char after Esc. Returns char or None.
-    Lets us detect Alt+key combos (sent as ESC+key by terminals)."""
+def word_left(buf, cursor):
+    """Index of the start of the word before the cursor (macOS Option+Left)."""
+    i = cursor
+    while i > 0 and buf[i - 1] == " ":
+        i -= 1
+    while i > 0 and buf[i - 1] != " ":
+        i -= 1
+    return i
+
+
+def word_right(buf, cursor):
+    """Index just past the end of the word after the cursor (Option+Right)."""
+    n = len(buf)
+    i = cursor
+    while i < n and buf[i] == " ":
+        i += 1
+    while i < n and buf[i] != " ":
+        i += 1
+    return i
+
+
+# Tokens returned by decode_escape().
+ESC_BARE = None
+ESC_OTHER = "other"
+ESC_ALT_BACKSPACE = "alt-backspace"
+ESC_WORD_LEFT = "word-left"
+ESC_WORD_RIGHT = "word-right"
+
+
+def decode_escape(stdscr):
+    """Decode the bytes following an ESC that get_wch() already returned.
+
+    Returns one of the ESC_* tokens. Recognizes Option/Alt + Left/Right word
+    motion (xterm 'ESC [ 1 ; 3 D|C' and meta 'ESC b' / 'ESC f'), Alt+Backspace
+    ('ESC' + backspace), and a bare Escape (no bytes follow). Other escape
+    sequences are consumed and reported as ESC_OTHER."""
     stdscr.nodelay(True)
     try:
-        nxt = stdscr.get_wch()
-    except curses.error:
-        nxt = None
+        try:
+            c = stdscr.get_wch()
+        except curses.error:
+            return ESC_BARE
+        if is_backspace(c):
+            return ESC_ALT_BACKSPACE
+        if c in ("b", "B"):
+            return ESC_WORD_LEFT
+        if c in ("f", "F"):
+            return ESC_WORD_RIGHT
+        if c in ("[", "O"):
+            params = []
+            final = None
+            for _ in range(16):
+                try:
+                    nxt = stdscr.get_wch()
+                except curses.error:
+                    break
+                if isinstance(nxt, str) and len(nxt) == 1 and (
+                    nxt.isalpha() or nxt == "~"
+                ):
+                    final = nxt
+                    break
+                params.append(nxt if isinstance(nxt, str) else "")
+            if final in ("C", "D"):
+                mod = "".join(params).split(";")[-1]
+                if mod == "3":  # Alt / Option
+                    return ESC_WORD_RIGHT if final == "C" else ESC_WORD_LEFT
+        return ESC_OTHER
     finally:
         stdscr.nodelay(False)
-    return nxt
 
 
 # --- Text editor core ---
@@ -445,6 +503,30 @@ def editor_word_delete_back(buf):
         new_cx -= 1
     lines[buf.cy] = line[:new_cx] + line[buf.cx:]
     buf.cx = new_cx
+
+
+def editor_word_left(buf):
+    """Move the cursor to the start of the previous word (Option+Left).
+    At the start of a line, wrap to the end of the previous line."""
+    if buf.cx == 0:
+        if buf.cy > 0:
+            buf.cy -= 1
+            buf.cx = len(buf.lines[buf.cy])
+        return
+    line = buf.lines[buf.cy]
+    buf.cx = word_left(line, buf.cx)
+
+
+def editor_word_right(buf):
+    """Move the cursor past the end of the next word (Option+Right).
+    At the end of a line, wrap to the start of the next line."""
+    line = buf.lines[buf.cy]
+    if buf.cx >= len(line):
+        if buf.cy < len(buf.lines) - 1:
+            buf.cy += 1
+            buf.cx = 0
+        return
+    buf.cx = word_right(line, buf.cx)
 
 
 def editor_handle_key(buf, ch, width):
@@ -557,11 +639,15 @@ def edit_notes(stdscr, title, initial_text):
             if ch == "\x03":
                 return result()
             if ch == "\x1b":
-                nxt = read_alt_modifier(stdscr)
-                if nxt is None:
+                tok = decode_escape(stdscr)
+                if tok is ESC_BARE:
                     return result()
-                if is_backspace(nxt):
+                if tok == ESC_ALT_BACKSPACE:
                     editor_word_delete_back(buf)
+                elif tok == ESC_WORD_LEFT:
+                    editor_word_left(buf)
+                elif tok == ESC_WORD_RIGHT:
+                    editor_word_right(buf)
                 continue
             if ch == curses.KEY_RESIZE:
                 continue
@@ -897,11 +983,15 @@ def run(stdscr):
                     commit_rename()
                     continue
                 if ch == "\x1b":
-                    nxt = read_alt_modifier(stdscr)
-                    if nxt is None:
+                    tok = decode_escape(stdscr)
+                    if tok is ESC_BARE:
                         commit_rename()
-                    elif is_backspace(nxt):
+                    elif tok == ESC_ALT_BACKSPACE:
                         rename_cursor = delete_word_back(rename_buf, rename_cursor)
+                    elif tok == ESC_WORD_LEFT:
+                        rename_cursor = word_left(rename_buf, rename_cursor)
+                    elif tok == ESC_WORD_RIGHT:
+                        rename_cursor = word_right(rename_buf, rename_cursor)
                     continue
                 if ch == "\x03":
                     commit_rename()
@@ -939,12 +1029,16 @@ def run(stdscr):
                         save_notepad()
                         break
                     if ch == "\x1b":
-                        nxt = read_alt_modifier(stdscr)
-                        if nxt is None:
+                        tok = decode_escape(stdscr)
+                        if tok is ESC_BARE:
                             save_notepad()
                             notepad_editing = False
-                        elif is_backspace(nxt):
+                        elif tok == ESC_ALT_BACKSPACE:
                             editor_word_delete_back(notepad)
+                        elif tok == ESC_WORD_LEFT:
+                            editor_word_left(notepad)
+                        elif tok == ESC_WORD_RIGHT:
+                            editor_word_right(notepad)
                         continue
                     if ch == curses.KEY_RESIZE:
                         continue
@@ -1006,12 +1100,16 @@ def run(stdscr):
                         input_buf = []
                         input_cursor = 0
                 elif ch == "\x1b":
-                    nxt = read_alt_modifier(stdscr)
-                    if nxt is None:
+                    tok = decode_escape(stdscr)
+                    if tok is ESC_BARE:
                         input_buf = []
                         input_cursor = 0
-                    elif is_backspace(nxt):
+                    elif tok == ESC_ALT_BACKSPACE:
                         input_cursor = delete_word_back(input_buf, input_cursor)
+                    elif tok == ESC_WORD_LEFT:
+                        input_cursor = word_left(input_buf, input_cursor)
+                    elif tok == ESC_WORD_RIGHT:
+                        input_cursor = word_right(input_buf, input_cursor)
                 elif ch == CTRL_W:
                     input_cursor = delete_word_back(input_buf, input_cursor)
                 elif is_backspace(ch):
@@ -1106,7 +1204,7 @@ def run(stdscr):
                         tasks = list_tasks(conn)
                         selected = max(0, min(sel, len(tasks)))
                 elif ch == "\x1b":
-                    read_alt_modifier(stdscr)
+                    decode_escape(stdscr)
                 elif ch == curses.KEY_RESIZE:
                     pass
     finally:
