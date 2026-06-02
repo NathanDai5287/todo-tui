@@ -545,12 +545,20 @@ def editor_handle_key(buf, ch, width):
             tli, toff, ttext = rows[cur_row - 1]
             buf.cy = tli
             buf.cx = toff + min(cur_col, len(ttext))
+        else:
+            # Already on the first line: jump to its start (macOS behavior).
+            buf.cy = 0
+            buf.cx = 0
     elif ch == curses.KEY_DOWN:
         rows, cur_row, cur_col = editor_layout(lines, buf.cy, buf.cx, width)
         if cur_row < len(rows) - 1:
             tli, toff, ttext = rows[cur_row + 1]
             buf.cy = tli
             buf.cx = toff + min(cur_col, len(ttext))
+        else:
+            # Already on the last line: jump to its end (macOS behavior).
+            buf.cy = len(lines) - 1
+            buf.cx = len(lines[buf.cy])
     elif ch == curses.KEY_LEFT:
         if buf.cx > 0:
             buf.cx -= 1
