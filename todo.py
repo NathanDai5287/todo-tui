@@ -26,7 +26,7 @@ HELP_TASK = [
 ]
 HELP_RENAME = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
 HELP_NOTES_ITEMS = [("⏎", "newline"), ("esc", "save & close")]
-HELP_NOTEPAD = [("⏎", "edit"), ("↑", "tasks"), ("q", "quit")]
+HELP_NOTEPAD = [("⏎", "edit"), ("c", "copy"), ("↑", "tasks"), ("q", "quit")]
 HELP_NOTEPAD_EDIT = [("⏎", "newline"), ("esc", "save"), ("ctrl+w", "word")]
 
 INPUT_PREFIX = " + "
@@ -1149,6 +1149,9 @@ def run(stdscr):
                     break
                 if ch == "\n" or ch == "\r":
                     notepad_editing = True
+                elif ch == "c" or ch == "C":
+                    if notepad.text:
+                        copy_to_clipboard(notepad.text)
                 elif ch == curses.KEY_UP:
                     notepad_focused = False
                     selected = len(tasks) if tasks else 0
