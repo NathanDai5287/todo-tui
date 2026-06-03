@@ -3,6 +3,7 @@
 
 import curses
 import locale
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -13,16 +14,20 @@ DB_PATH = Path.home() / ".todo.db"
 BACKSPACE_KEYS = (curses.KEY_BACKSPACE, "\x7f", "\x08")
 UNDO_DEPTH = 100
 
-HELP_INPUT_BAR = (
-    " ⏎ add · ↓ tasks · ⌃w word · esc clear · ⌫ undo · ⌃c quit "
-)
-HELP_TASK_BAR = (
-    " ↑↓ nav · ⇧↑↓ move · ␣ done · ⇥ status · ⏎ notes · c copy · F2 rename · x del · ⌫ undo · q quit "
-)
-HELP_RENAME_BAR = " type · ⏎/esc save · ⌃w word "
-HELP_NOTES = " ⏎ newline · esc save & close "
-HELP_NOTEPAD_BAR = " ⏎ edit · ↑ tasks · q quit "
-HELP_NOTEPAD_EDIT_BAR = " ⏎ newline · esc save · ⌃w word "
+HELP_INPUT = [
+    ("⏎", "add"), ("↓", "tasks"), ("ctrl+w", "word"),
+    ("esc", "clear"), ("⌫", "undo"), ("ctrl+c", "quit"),
+]
+HELP_TASK = [
+    ("↑↓", "nav"), ("shift+↑↓", "move"), ("space", "done"),
+    ("tab", "status"), ("⏎", "notes"), ("o", "open PR"),
+    ("c", "copy"), ("F2", "rename"), ("x", "del"), ("⌫", "undo"),
+    ("q", "quit"),
+]
+HELP_RENAME = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
+HELP_NOTES_ITEMS = [("⏎", "newline"), ("esc", "save & close")]
+HELP_NOTEPAD = [("⏎", "edit"), ("↑", "tasks"), ("q", "quit")]
+HELP_NOTEPAD_EDIT = [("⏎", "newline"), ("esc", "save"), ("ctrl+w", "word")]
 
 INPUT_PREFIX = " + "
 INPUT_INDENT = "   "
@@ -243,8 +248,46 @@ def fill_line(win, y, x, width, text, attr=0):
     safe_addstr(win, y, x, padded, attr)
 
 
+def render_help_bar(win, y, items, width):
+    fill_line(win, y, 0, width, "", curses.A_REVERSE)
+    key_attr = curses.A_REVERSE | curses.A_BOLD
+    label_attr = curses.A_REVERSE
+    x = 1
+    for key, label in items:
+        item_len = len(key) + (1 + len(label) if label else 0)
+        if x + item_len > width - 1:
+            break
+        safe_addstr(win, y, x, key, key_attr)
+        x += len(key)
+        if label:
+            safe_addstr(win, y, x, " " + label, label_attr)
+            x += 1 + len(label)
+        x += 2
+
+
 def is_backspace(ch):
     return ch in BACKSPACE_KEYS
+
+
+_PR_URL_RE = re.compile(
+    r'https://github\.com/[^\s]+/pull/\d+'
+    r'|https://gitlab\.com/[^\s]+/-/merge_requests/\d+'
+)
+
+
+def find_pr_url(*texts):
+    for text in texts:
+        m = _PR_URL_RE.search(text)
+        if m:
+            return m.group()
+    return None
+
+
+def open_url(url):
+    try:
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
 
 
 def copy_to_clipboard(text):
@@ -669,7 +712,7 @@ def edit_notes(stdscr, title, initial_text):
                 _, _, text = display_rows[ri]
                 fill_line(stdscr, 1 + i, 0, w, text)
 
-            fill_line(stdscr, h - 1, 0, w - 1, HELP_NOTES, curses.A_REVERSE)
+            render_help_bar(stdscr, h - 1, HELP_NOTES_ITEMS, w - 1)
             try:
                 stdscr.move(1 + (cur_row - buf.scroll_y), min(cur_col, w - 1))
             except curses.error:
@@ -919,16 +962,16 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
 
     # --- Help bar ---
     if renaming:
-        help_text = HELP_RENAME_BAR
+        help_items = HELP_RENAME
     elif notepad_editing:
-        help_text = HELP_NOTEPAD_EDIT_BAR
+        help_items = HELP_NOTEPAD_EDIT
     elif notepad_focused:
-        help_text = HELP_NOTEPAD_BAR
+        help_items = HELP_NOTEPAD
     elif input_focused:
-        help_text = HELP_INPUT_BAR
+        help_items = HELP_INPUT
     else:
-        help_text = HELP_TASK_BAR
-    fill_line(stdscr, h - 1, 0, w - 1, help_text, curses.A_REVERSE)
+        help_items = HELP_TASK
+    render_help_bar(stdscr, h - 1, help_items, w - 1)
 
     # --- Cursor placement (LAST) ---
     cursor_pos = None
@@ -1269,6 +1312,10 @@ def run(stdscr):
                                 notepad, notepad_focused, notepad_editing,
                             )
                             curses.napms(80)
+                elif ch == "o" or ch == "O":
+                    url = find_pr_url(notes, title)
+                    if url:
+                        open_url(url)
                 elif ch == F2_KEY:
                     renaming = True
                     rename_buf = list(title)
