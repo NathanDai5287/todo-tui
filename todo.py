@@ -4,6 +4,7 @@
 import curses
 import locale
 import sqlite3
+import subprocess
 from pathlib import Path
 
 locale.setlocale(locale.LC_ALL, "")
@@ -16,7 +17,7 @@ HELP_INPUT_BAR = (
     " ⏎ add · ↓ tasks · ⌃w word · esc clear · ⌫ undo · ⌃c quit "
 )
 HELP_TASK_BAR = (
-    " ↑↓ nav · ⇧↑↓ move · ␣ done · ⏎ notes · F2 rename · x del · ⌫ undo · q quit "
+    " ↑↓ nav · ⇧↑↓ move · ␣ done · ⇥ status · ⏎ notes · c copy · F2 rename · x del · ⌫ undo · q quit "
 )
 HELP_RENAME_BAR = " type · ⏎/esc save · ⌃w word "
 HELP_NOTES = " ⏎ newline · esc save & close "
@@ -43,6 +44,13 @@ HEADING_PLAIN_LEAD = "──"  # heading lead-in for an unfocused panel
 F2_KEY = curses.KEY_F0 + 2
 CTRL_W = "\x17"
 
+STATUS_NONE = 0
+STATUS_WIP = 1
+STATUS_PR = 2
+STATUS_MERGED = 3
+STATUS_COUNT = 4
+STATUS_COLOR_PAIR = {STATUS_NONE: 0, STATUS_WIP: 1, STATUS_PR: 2, STATUS_MERGED: 3}
+
 
 # --- Database ---
 
@@ -56,7 +64,8 @@ def db_connect():
                 title TEXT NOT NULL,
                 notes TEXT NOT NULL DEFAULT '',
                 position INTEGER NOT NULL,
-                done INTEGER NOT NULL DEFAULT 0
+                done INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -64,6 +73,10 @@ def db_connect():
         if "done" not in cols:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN done INTEGER NOT NULL DEFAULT 0"
+            )
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN status INTEGER NOT NULL DEFAULT 0"
             )
         conn.execute(
             """
@@ -94,7 +107,7 @@ def set_notepad(conn, text):
 
 def list_tasks(conn):
     return conn.execute(
-        "SELECT id, title, notes, done FROM tasks "
+        "SELECT id, title, notes, done, status FROM tasks "
         "ORDER BY done ASC, position ASC, id ASC"
     ).fetchall()
 
@@ -179,9 +192,22 @@ def toggle_done(conn, task_id):
         )
 
 
+def cycle_status(conn, task_id, direction=1):
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return
+    new_status = (row[0] + direction) % STATUS_COUNT
+    with conn:
+        conn.execute(
+            "UPDATE tasks SET status=? WHERE id=?", (new_status, task_id)
+        )
+
+
 def snapshot(conn):
     return conn.execute(
-        "SELECT id, title, notes, position, done FROM tasks"
+        "SELECT id, title, notes, position, done, status FROM tasks"
     ).fetchall()
 
 
@@ -189,8 +215,8 @@ def restore(conn, snap):
     with conn:
         conn.execute("DELETE FROM tasks")
         conn.executemany(
-            "INSERT INTO tasks (id, title, notes, position, done) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, title, notes, position, done, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             snap,
         )
 
@@ -219,6 +245,13 @@ def fill_line(win, y, x, width, text, attr=0):
 
 def is_backspace(ch):
     return ch in BACKSPACE_KEYS
+
+
+def copy_to_clipboard(text):
+    try:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+    except (OSError, subprocess.CalledProcessError):
+        pass
 
 
 def set_cursor(visible):
@@ -689,7 +722,7 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
     for i, task in enumerate(tasks):
         if i == split_idx and i > 0:
             rows.append({"kind": "gap", "task_idx": None, "text": "", "attr": 0})
-        _tid, title, notes, done = task
+        _tid, title, notes, done, status = task
         if rename_idx == i and rename_text is not None:
             title = rename_text
         checkbox = "[x]" if done else "[ ]"
@@ -713,6 +746,7 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
                     "task_idx": i,
                     "text": prefix + line,
                     "attr": attr,
+                    "status": status if j == 0 else STATUS_NONE,
                 }
             )
     return rows, rename_pos
@@ -720,7 +754,8 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
 
 def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 renaming, rename_buf, rename_cursor,
-                notepad, notepad_focused, notepad_editing):
+                notepad, notepad_focused, notepad_editing,
+                flash_task_idx=None):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
@@ -812,8 +847,17 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
             and selected > 0
             and not renaming
         ):
-            attr = curses.A_REVERSE
+            if flash_task_idx is not None and r["task_idx"] == flash_task_idx:
+                attr = curses.A_BOLD
+            else:
+                attr = curses.A_REVERSE
         fill_line(stdscr, task_area_start + i, 0, w, r["text"], attr)
+        status_cp = STATUS_COLOR_PAIR.get(r.get("status", STATUS_NONE), 0)
+        if status_cp:
+            try:
+                stdscr.chgat(task_area_start + i, 1, 3, curses.color_pair(status_cp))
+            except curses.error:
+                pass
         if (
             r["kind"] == "task"
             and r["task_idx"] == (selected - 1)
@@ -913,6 +957,11 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
 def run(stdscr):
     if hasattr(curses, "set_escdelay"):
         curses.set_escdelay(25)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
     set_cursor(False)
     stdscr.keypad(True)
 
@@ -1145,7 +1194,7 @@ def run(stdscr):
                 if task_idx >= len(tasks):
                     selected = len(tasks)
                     continue
-                tid, title, notes, _done = tasks[task_idx]
+                tid, title, notes, _done, _status = tasks[task_idx]
 
                 if ch == "q" or ch == "Q":
                     break
@@ -1187,12 +1236,39 @@ def run(stdscr):
                     )
                     if new_idx is not None:
                         selected = new_idx + 1
+                elif ch == "\t":
+                    push_undo()
+                    cycle_status(conn, tid, 1)
+                    tasks = list_tasks(conn)
+                elif ch == curses.KEY_BTAB:
+                    push_undo()
+                    cycle_status(conn, tid, -1)
+                    tasks = list_tasks(conn)
                 elif ch == "\n" or ch == "\r":
                     new = edit_notes(stdscr, title, notes)
                     if new is not None and new != notes:
                         push_undo()
                         update_notes(conn, tid, new)
                         tasks = list_tasks(conn)
+                elif ch == "c" or ch == "C":
+                    if notes:
+                        copy_to_clipboard(notes)
+                        for _ in range(2):
+                            scroll, _ = render_main(
+                                stdscr, tasks, selected, scroll,
+                                input_buf, input_cursor,
+                                False, rename_buf, rename_cursor,
+                                notepad, notepad_focused, notepad_editing,
+                                flash_task_idx=task_idx,
+                            )
+                            curses.napms(80)
+                            scroll, _ = render_main(
+                                stdscr, tasks, selected, scroll,
+                                input_buf, input_cursor,
+                                False, rename_buf, rename_cursor,
+                                notepad, notepad_focused, notepad_editing,
+                            )
+                            curses.napms(80)
                 elif ch == F2_KEY:
                     renaming = True
                     rename_buf = list(title)
