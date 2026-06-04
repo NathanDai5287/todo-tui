@@ -20,14 +20,16 @@ HELP_INPUT = [
 ]
 HELP_TASK = [
     ("↑↓", "nav"), ("shift+↑↓", "move"), ("space", "done"),
-    ("tab", "status"), ("⏎", "notes"), ("o", "open PR"),
+    ("tab", "status"), ("⏎", "notes"), ("→", "links"), ("o", "open PR"),
     ("c", "copy"), ("F2", "rename"), ("x", "del"), ("⌫", "undo"),
     ("q", "quit"),
 ]
 HELP_RENAME = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
-HELP_NOTES_ITEMS = [("⏎", "newline"), ("esc", "save & close")]
-HELP_NOTEPAD = [("⏎", "edit"), ("c", "copy"), ("↑", "tasks"), ("q", "quit")]
-HELP_NOTEPAD_EDIT = [("⏎", "newline"), ("esc", "save"), ("ctrl+w", "word")]
+HELP_NOTES_ITEMS = [
+    ("⏎", "newline"), ("tab", "indent"), ("⇧tab", "dedent"),
+    ("esc", "save & close"),
+]
+HELP_LINKS_ITEMS = [("↑↓", "nav"), ("⏎/o", "open"), ("esc/←", "back")]
 
 INPUT_PREFIX = " + "
 INPUT_INDENT = "   "
@@ -36,10 +38,7 @@ INPUT_PLACEHOLDER = "New task..."
 TASK_PREFIX_LEN = 7  # " [x] · "
 TASK_INDENT = " " * TASK_PREFIX_LEN
 
-NOTEPAD_HEIGHT = 5  # visible content rows in the notepad pane
-NOTEPAD_PREFIX_LEN = 1  # one-space left margin for notepad content
-NOTEPAD_LABEL = " notes "
-NOTEPAD_PLACEHOLDER = "notes…"
+EDITOR_INDENT = "    "  # one indent level in the notes editor (Tab / Shift+Tab)
 
 HEADER_ROWS = 1  # the "todo" heading occupies the top row
 TODO_LABEL = " todo "
@@ -53,8 +52,11 @@ STATUS_NONE = 0
 STATUS_WIP = 1
 STATUS_PR = 2
 STATUS_MERGED = 3
-STATUS_COUNT = 4
-STATUS_COLOR_PAIR = {STATUS_NONE: 0, STATUS_WIP: 1, STATUS_PR: 2, STATUS_MERGED: 3}
+STATUS_WONT = 4
+STATUS_COUNT = 5
+STATUS_COLOR_PAIR = {
+    STATUS_NONE: 0, STATUS_WIP: 1, STATUS_PR: 2, STATUS_MERGED: 3, STATUS_WONT: 4,
+}
 
 
 # --- Database ---
@@ -93,21 +95,6 @@ def db_connect():
         )
     return conn
 
-
-def get_notepad(conn):
-    row = conn.execute(
-        "SELECT value FROM meta WHERE key='notepad'"
-    ).fetchone()
-    return row[0] if row else ""
-
-
-def set_notepad(conn, text):
-    with conn:
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('notepad', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (text,),
-        )
 
 
 def list_tasks(conn):
@@ -265,6 +252,19 @@ def render_help_bar(win, y, items, width):
         x += 2
 
 
+def draw_modal_header(stdscr, w, text, status):
+    """Draw a full-width reversed header bar at row 0 with a colored status block
+    on the left when the task has a status."""
+    cp = STATUS_COLOR_PAIR.get(status, 0)
+    chip_w = 2 if cp else 0
+    fill_line(stdscr, 0, 0, w, " " * chip_w + " " + text + " ", curses.A_REVERSE)
+    if chip_w:
+        try:
+            stdscr.chgat(0, 0, chip_w, curses.color_pair(cp))
+        except curses.error:
+            pass
+
+
 def is_backspace(ch):
     return ch in BACKSPACE_KEYS
 
@@ -281,6 +281,24 @@ def find_pr_url(*texts):
         if m:
             return m.group()
     return None
+
+
+_URL_RE = re.compile(r'https?://[^\s<>"\'`]+')
+# Trailing punctuation that's usually sentence/markdown noise, not part of a URL.
+_URL_TRAILING = ".,;:!?)]}>\"'"
+
+
+def find_urls(*texts):
+    """Return de-duplicated http(s) URLs found in the texts, in order."""
+    urls = []
+    seen = set()
+    for text in texts:
+        for m in _URL_RE.finditer(text):
+            url = m.group().rstrip(_URL_TRAILING)
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(url)
+    return urls
 
 
 def open_url(url):
@@ -475,7 +493,7 @@ def decode_escape(stdscr):
 # --- Text editor core ---
 #
 # A small word-wrapping multi-line editor shared by the full-screen task-notes
-# modal (edit_notes) and the inline notepad pane on the main view. State lives
+# modal (edit_notes). State lives
 # in a TextBuffer; layout and key handling are free functions so a caller can
 # mount the editor in any rectangle it owns and drive its own draw loop.
 
@@ -667,6 +685,19 @@ def editor_handle_key(buf, ch, width):
         elif buf.cy < len(lines) - 1:
             lines[buf.cy] = lines[buf.cy] + lines[buf.cy + 1]
             del lines[buf.cy + 1]
+    elif ch == "\t":
+        # Insert one indent level at the cursor.
+        lines[buf.cy] = (
+            lines[buf.cy][: buf.cx] + EDITOR_INDENT + lines[buf.cy][buf.cx:]
+        )
+        buf.cx += len(EDITOR_INDENT)
+    elif ch == curses.KEY_BTAB:
+        # Unindent the current line by up to one level.
+        line = lines[buf.cy]
+        remove = min(len(EDITOR_INDENT), len(line) - len(line.lstrip(" ")))
+        if remove:
+            lines[buf.cy] = line[remove:]
+            buf.cx = max(0, buf.cx - remove)
     elif ch == "\n" or ch == "\r":
         tail = lines[buf.cy][buf.cx:]
         lines[buf.cy] = lines[buf.cy][: buf.cx]
@@ -683,7 +714,7 @@ def editor_handle_key(buf, ch, width):
 
 # --- Notes editor ---
 
-def edit_notes(stdscr, title, initial_text):
+def edit_notes(stdscr, title, initial_text, status=STATUS_NONE):
     """Full-screen editor for a task's notes. Esc/Ctrl-C save & close.
     Returns the edited text, or None if nothing changed."""
     original = initial_text
@@ -697,7 +728,7 @@ def edit_notes(stdscr, title, initial_text):
         while True:
             h, w = stdscr.getmaxyx()
             stdscr.erase()
-            fill_line(stdscr, 0, 0, w, " notes — " + title + " ", curses.A_REVERSE)
+            draw_modal_header(stdscr, w, "notes — " + title, status)
 
             display_rows, cur_row, cur_col = editor_layout(
                 buf.lines, buf.cy, buf.cx, w
@@ -738,6 +769,58 @@ def edit_notes(stdscr, title, initial_text):
             editor_handle_key(buf, ch, w)
     finally:
         set_cursor(False)
+
+
+def pick_link(stdscr, title, urls, status=STATUS_NONE):
+    """Modal list of links detected in a task. Up/down to navigate, enter/o to
+    open the selected link in the browser, esc/left to close."""
+    sel = 0
+    scroll = 0
+    while True:
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        draw_modal_header(stdscr, w, "links — " + title, status)
+
+        list_h = max(1, h - 2)
+        if sel < scroll:
+            scroll = sel
+        elif sel >= scroll + list_h:
+            scroll = sel - list_h + 1
+
+        for i in range(list_h):
+            idx = scroll + i
+            if idx >= len(urls):
+                break
+            selected_row = idx == sel
+            marker = " · " if selected_row else "   "
+            attr = curses.A_BOLD if selected_row else curses.A_NORMAL
+            fill_line(stdscr, 1 + i, 0, w, marker + urls[idx], attr)
+
+        render_help_bar(stdscr, h - 1, HELP_LINKS_ITEMS, w - 1)
+        stdscr.refresh()
+
+        ch = stdscr.get_wch()
+        if ch == "\x03":
+            return
+        if ch == "\x1b":
+            tok = decode_escape(stdscr)
+            if tok is ESC_BARE:
+                return
+            continue
+        if ch in (curses.KEY_UP, "k"):
+            sel = (sel - 1) % len(urls)
+        elif ch in (curses.KEY_DOWN, "j"):
+            sel = (sel + 1) % len(urls)
+        elif ch == curses.KEY_HOME:
+            sel = 0
+        elif ch == curses.KEY_END:
+            sel = len(urls) - 1
+        elif ch in ("\n", "\r", "o", "O"):
+            open_url(urls[sel])
+        elif ch in (curses.KEY_LEFT, "q", "Q"):
+            return
+        elif ch == curses.KEY_RESIZE:
+            continue
 
 
 # --- Main view ---
@@ -797,21 +880,19 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
 
 def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 renaming, rename_buf, rename_cursor,
-                notepad, notepad_focused, notepad_editing,
                 flash_task_idx=None):
     h, w = stdscr.getmaxyx()
     stdscr.erase()
 
-    input_focused = (selected == 0) and not renaming and not notepad_focused
-    todo_active = not notepad_focused
+    input_focused = (selected == 0) and not renaming
     prefix_len = len(INPUT_PREFIX)
     avail_input = max(1, w - prefix_len)
     input_text = "".join(input_buf)
 
     # --- "todo" heading ---
     safe_addstr(
-        stdscr, 0, 0, heading_bar(TODO_LABEL, w, todo_active),
-        curses.A_BOLD if todo_active else curses.A_DIM,
+        stdscr, 0, 0, heading_bar(TODO_LABEL, w, True),
+        curses.A_BOLD,
     )
 
     # --- Input field ---
@@ -838,16 +919,8 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         attr = curses.A_NORMAL if input_focused else curses.A_DIM
         fill_line(stdscr, HEADER_ROWS + i, 0, w, p + line, attr)
 
-    # --- Geometry: reserve a notepad pane at the bottom when it fits ---
-    sep_row = h - NOTEPAD_HEIGHT - 2
     task_area_start = HEADER_ROWS + input_rows
-    notepad_visible = sep_row - task_area_start >= 1
-    if notepad_visible:
-        task_area_end = sep_row
-        pad_content_start = sep_row + 1
-    else:
-        task_area_end = h - 1
-        pad_content_start = None
+    task_area_end = h - 1
     task_area_h = max(1, task_area_end - task_area_start)
 
     # --- Tasks ---
@@ -881,10 +954,7 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
             break
         r = rows[ri]
         attr = r["attr"]
-        if notepad_focused:
-            # Todo panel inactive: dim but keep readable, no selection bar.
-            attr = curses.A_DIM
-        elif (
+        if (
             r["kind"] == "task"
             and r["task_idx"] == (selected - 1)
             and selected > 0
@@ -919,54 +989,9 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 curses.A_DIM,
             )
 
-    # --- Notepad pane ---
-    pad_cursor = None
-    if notepad_visible:
-        safe_addstr(
-            stdscr, sep_row, 0, heading_bar(NOTEPAD_LABEL, w, notepad_focused),
-            curses.A_BOLD if notepad_focused else curses.A_DIM,
-        )
-
-        content_attr = curses.A_NORMAL if notepad_focused else curses.A_DIM
-        pad_width = max(1, w - NOTEPAD_PREFIX_LEN)
-        if notepad.text == "" and not notepad_editing:
-            safe_addstr(
-                stdscr, pad_content_start, NOTEPAD_PREFIX_LEN,
-                NOTEPAD_PLACEHOLDER, curses.A_DIM,
-            )
-        else:
-            display_rows, cur_row, cur_col = editor_layout(
-                notepad.lines, notepad.cy, notepad.cx, pad_width
-            )
-            if notepad_editing:
-                editor_scroll(notepad, display_rows, cur_row, NOTEPAD_HEIGHT)
-            else:
-                notepad.scroll_y = max(
-                    0,
-                    min(notepad.scroll_y,
-                        max(0, len(display_rows) - NOTEPAD_HEIGHT)),
-                )
-            for i in range(NOTEPAD_HEIGHT):
-                ri = notepad.scroll_y + i
-                if ri >= len(display_rows):
-                    break
-                text = display_rows[ri][2]
-                fill_line(
-                    stdscr, pad_content_start + i, 0, w,
-                    " " * NOTEPAD_PREFIX_LEN + text, content_attr,
-                )
-            if notepad_editing:
-                cr = pad_content_start + (cur_row - notepad.scroll_y)
-                cc = NOTEPAD_PREFIX_LEN + cur_col
-                pad_cursor = (cr, min(cc, w - 1))
-
     # --- Help bar ---
     if renaming:
         help_items = HELP_RENAME
-    elif notepad_editing:
-        help_items = HELP_NOTEPAD_EDIT
-    elif notepad_focused:
-        help_items = HELP_NOTEPAD
     elif input_focused:
         help_items = HELP_INPUT
     else:
@@ -983,8 +1008,6 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
     elif renaming and sel_screen_first_row is not None and rename_pos is not None:
         c_line, c_col = rename_pos
         cursor_pos = (sel_screen_first_row + c_line, min(c_col, w - 1))
-    elif notepad_editing and pad_cursor is not None:
-        cursor_pos = pad_cursor
 
     if cursor_pos is not None:
         try:
@@ -994,7 +1017,7 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
     set_cursor(cursor_pos is not None)
     stdscr.refresh()
 
-    return scroll, notepad_visible
+    return scroll
 
 
 def run(stdscr):
@@ -1005,6 +1028,7 @@ def run(stdscr):
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
     curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_RED)
     set_cursor(False)
     stdscr.keypad(True)
 
@@ -1020,14 +1044,6 @@ def run(stdscr):
     rename_buf = []
     rename_cursor = 0
     rename_target_id = None
-
-    notepad = TextBuffer(get_notepad(conn))
-    notepad_focused = False
-    notepad_editing = False
-    notepad_visible = False
-
-    def save_notepad():
-        set_notepad(conn, notepad.text)
 
     undo_stack = []
 
@@ -1065,15 +1081,11 @@ def run(stdscr):
             max_sel = len(tasks)
             selected = max(0, min(selected, max_sel))
 
-            scroll, notepad_visible = render_main(
+            scroll = render_main(
                 stdscr, tasks, selected, scroll,
                 input_buf, input_cursor,
                 renaming, rename_buf, rename_cursor,
-                notepad, notepad_focused, notepad_editing,
             )
-            if not notepad_visible and notepad_focused:
-                notepad_focused = False
-                notepad_editing = False
 
             ch = stdscr.get_wch()
 
@@ -1121,48 +1133,6 @@ def run(stdscr):
                 # any other key ignored
                 continue
 
-            # --- NOTEPAD MODE ---
-            if notepad_focused:
-                pad_width = max(1, w - NOTEPAD_PREFIX_LEN)
-                if notepad_editing:
-                    if ch == "\x03":
-                        save_notepad()
-                        break
-                    if ch == "\x1b":
-                        tok = decode_escape(stdscr)
-                        if tok is ESC_BARE:
-                            save_notepad()
-                            notepad_editing = False
-                        elif tok == ESC_ALT_BACKSPACE:
-                            editor_word_delete_back(notepad)
-                        elif tok == ESC_WORD_LEFT:
-                            editor_word_left(notepad)
-                        elif tok == ESC_WORD_RIGHT:
-                            editor_word_right(notepad)
-                        continue
-                    if ch == curses.KEY_RESIZE:
-                        continue
-                    editor_handle_key(notepad, ch, pad_width)
-                    continue
-                # idle: focused but not editing
-                if ch == "\x03" or ch == "q" or ch == "Q":
-                    break
-                if ch == "\n" or ch == "\r":
-                    notepad_editing = True
-                elif ch == "c" or ch == "C":
-                    if notepad.text:
-                        copy_to_clipboard(notepad.text)
-                elif ch == curses.KEY_UP:
-                    notepad_focused = False
-                    selected = len(tasks) if tasks else 0
-                elif ch == curses.KEY_HOME:
-                    notepad_focused = False
-                    selected = 0
-                elif ch == curses.KEY_RESIZE:
-                    pass
-                # any other key ignored
-                continue
-
             if ch == "\x03":
                 break
 
@@ -1181,8 +1151,6 @@ def run(stdscr):
                     else:
                         if tasks:
                             selected = 1
-                        elif notepad_visible:
-                            notepad_focused = True
                 elif ch == curses.KEY_UP:
                     if input_cursor >= avail_input:
                         input_cursor -= avail_input
@@ -1240,17 +1208,14 @@ def run(stdscr):
                 if task_idx >= len(tasks):
                     selected = len(tasks)
                     continue
-                tid, title, notes, _done, _status = tasks[task_idx]
+                tid, title, notes, _done, status = tasks[task_idx]
 
                 if ch == "q" or ch == "Q":
                     break
                 elif ch == curses.KEY_UP:
                     selected = max(0, selected - 1)
                 elif ch == curses.KEY_DOWN:
-                    if selected == max_sel and notepad_visible:
-                        notepad_focused = True
-                    else:
-                        selected = min(max_sel, selected + 1)
+                    selected = min(max_sel, selected + 1)
                 elif ch == curses.KEY_HOME:
                     selected = 0
                 elif ch == curses.KEY_END:
@@ -1291,7 +1256,7 @@ def run(stdscr):
                     cycle_status(conn, tid, -1)
                     tasks = list_tasks(conn)
                 elif ch == "\n" or ch == "\r":
-                    new = edit_notes(stdscr, title, notes)
+                    new = edit_notes(stdscr, title, notes, status)
                     if new is not None and new != notes:
                         push_undo()
                         update_notes(conn, tid, new)
@@ -1300,25 +1265,27 @@ def run(stdscr):
                     if notes:
                         copy_to_clipboard(notes)
                         for _ in range(2):
-                            scroll, _ = render_main(
+                            scroll = render_main(
                                 stdscr, tasks, selected, scroll,
                                 input_buf, input_cursor,
                                 False, rename_buf, rename_cursor,
-                                notepad, notepad_focused, notepad_editing,
                                 flash_task_idx=task_idx,
                             )
                             curses.napms(80)
-                            scroll, _ = render_main(
+                            scroll = render_main(
                                 stdscr, tasks, selected, scroll,
                                 input_buf, input_cursor,
                                 False, rename_buf, rename_cursor,
-                                notepad, notepad_focused, notepad_editing,
                             )
                             curses.napms(80)
                 elif ch == "o" or ch == "O":
                     url = find_pr_url(notes, title)
                     if url:
                         open_url(url)
+                elif ch == curses.KEY_RIGHT:
+                    urls = find_urls(notes, title)
+                    if urls:
+                        pick_link(stdscr, title, urls, status)
                 elif ch == F2_KEY:
                     renaming = True
                     rename_buf = list(title)
