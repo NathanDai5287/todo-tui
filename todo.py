@@ -3,6 +3,8 @@
 
 import curses
 import locale
+import os
+import plistlib
 import re
 import sqlite3
 import subprocess
@@ -20,7 +22,7 @@ HELP_INPUT = [
 ]
 HELP_TASK = [
     ("↑↓", "nav"), ("shift+↑↓", "move"), ("space", "done"),
-    ("tab", "status"), ("⏎", "notes"), ("→", "links"), ("o", "open PR"),
+    ("tab", "status"), ("⏎", "notes"), ("→", "links"),
     ("c", "copy"), ("F2", "rename"), ("x", "del"), ("⌫", "undo"),
     ("q", "quit"),
 ]
@@ -269,41 +271,79 @@ def is_backspace(ch):
     return ch in BACKSPACE_KEYS
 
 
-_PR_URL_RE = re.compile(
-    r'https://github\.com/[^\s]+/pull/\d+'
-    r'|https://gitlab\.com/[^\s]+/-/merge_requests/\d+'
-)
-
-
-def find_pr_url(*texts):
-    for text in texts:
-        m = _PR_URL_RE.search(text)
-        if m:
-            return m.group()
-    return None
-
-
 _URL_RE = re.compile(r'https?://[^\s<>"\'`]+')
 # Trailing punctuation that's usually sentence/markdown noise, not part of a URL.
 _URL_TRAILING = ".,;:!?)]}>\"'"
+# Absolute (/…) or home (~/…) file paths, including drag-and-dropped paths
+# whose spaces/specials are backslash-escaped (e.g. /Users/me/My\ File.txt).
+_FILE_RE = re.compile(r'(?:~/|/)(?:\\.|[^\s\\])*')
 
 
-def find_urls(*texts):
-    """Return de-duplicated http(s) URLs found in the texts, in order."""
-    urls = []
+def _unescape_path(token):
+    """Strip the backslash escaping a terminal adds to a dragged-in file path."""
+    return re.sub(r'\\(.)', r'\1', token).rstrip(_URL_TRAILING)
+
+
+def find_links(*texts):
+    """De-duplicated, openable links found in the texts, in appearance order.
+
+    Detects http(s) URLs and local file paths (absolute or ~-relative,
+    including drag-and-dropped paths with backslash-escaped spaces). A file
+    path is included only when it currently exists on disk, which also filters
+    out the slashes inside URLs. The returned file targets are unescaped and
+    ~-expanded so they can be handed straight to `open`."""
+    links = []
     seen = set()
     for text in texts:
+        matches = []
         for m in _URL_RE.finditer(text):
             url = m.group().rstrip(_URL_TRAILING)
-            if url and url not in seen:
-                seen.add(url)
-                urls.append(url)
-    return urls
+            if url:
+                matches.append((m.start(), url))
+        for m in _FILE_RE.finditer(text):
+            target = os.path.expanduser(_unescape_path(m.group()))
+            if target and os.path.lexists(target):
+                matches.append((m.start(), target))
+        matches.sort(key=lambda it: it[0])
+        for _pos, target in matches:
+            if target not in seen:
+                seen.add(target)
+                links.append(target)
+    return links
 
 
-def open_url(url):
+def _default_browser_bundle_id():
+    """Bundle id of the default web browser, read from the LaunchServices
+    http(s) scheme handler. Returns None if it can't be determined."""
+    plist = os.path.expanduser(
+        "~/Library/Preferences/com.apple.LaunchServices/"
+        "com.apple.launchservices.secure.plist"
+    )
     try:
-        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    for h in data.get("LSHandlers", []):
+        if h.get("LSHandlerURLScheme") in ("http", "https"):
+            bid = h.get("LSHandlerRoleAll") or h.get("LSHandlerRoleViewer")
+            if bid:
+                return bid
+    return None
+
+
+def open_link(target):
+    """Open a URL or local file via `open`. Local PDFs are opened in the
+    default browser rather than the default PDF app (Preview); remote URLs
+    already route to the browser."""
+    cmd = ["open", target]
+    is_remote = target.startswith(("http://", "https://"))
+    if not is_remote and target.lower().endswith(".pdf"):
+        bid = _default_browser_bundle_id()
+        if bid:
+            cmd = ["open", "-b", bid, target]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         pass
 
@@ -816,7 +856,7 @@ def pick_link(stdscr, title, urls, status=STATUS_NONE):
         elif ch == curses.KEY_END:
             sel = len(urls) - 1
         elif ch in ("\n", "\r", "o", "O"):
-            open_url(urls[sel])
+            open_link(urls[sel])
         elif ch in (curses.KEY_LEFT, "q", "Q"):
             return
         elif ch == curses.KEY_RESIZE:
@@ -1278,12 +1318,8 @@ def run(stdscr):
                                 False, rename_buf, rename_cursor,
                             )
                             curses.napms(80)
-                elif ch == "o" or ch == "O":
-                    url = find_pr_url(notes, title)
-                    if url:
-                        open_url(url)
                 elif ch == curses.KEY_RIGHT:
-                    urls = find_urls(notes, title)
+                    urls = find_links(notes, title)
                     if urls:
                         pick_link(stdscr, title, urls, status)
                 elif ch == F2_KEY:
