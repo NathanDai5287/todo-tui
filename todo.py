@@ -1065,6 +1065,23 @@ def run(stdscr):
         curses.set_escdelay(25)
     curses.start_color()
     curses.use_default_colors()
+    # Pin the chip palette to Ghostty's built-in default RGB values so the
+    # status colors look identical across platforms instead of inheriting each
+    # terminal's own palette (Windows console renders the named ANSI colors
+    # much darker/duller than Ghostty's pastel defaults). Values from Ghostty's
+    # default palette (src/terminal/color.zig), scaled from 0-255 to 0-1000.
+    if curses.can_change_color():
+        for color, (r, g, b) in (
+            (curses.COLOR_BLACK, (29, 31, 33)),     # #1D1F21
+            (curses.COLOR_RED, (204, 102, 102)),    # #CC6666
+            (curses.COLOR_GREEN, (181, 189, 104)),  # #B5BD68
+            (curses.COLOR_YELLOW, (240, 198, 116)), # #F0C674
+            (curses.COLOR_MAGENTA, (178, 148, 187)),# #B294BB
+        ):
+            try:
+                curses.init_color(color, r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
+            except curses.error:
+                pass
     curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
     curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
     curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
