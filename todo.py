@@ -25,16 +25,18 @@ PASTE_COLLAPSE_LINES = 4
 PASTE_RE = re.compile(r"\[Pasted text #(\d+) \+\d+ lines?\]")
 
 HELP_INPUT = [
-    ("⏎", "add"), ("↓", "tasks"), ("ctrl+w", "word"),
-    ("esc", "clear"), ("⌫", "undo"), ("ctrl+c", "quit"),
+    ("⏎", "add"), ("↓/esc", "tasks"), ("ctrl+w", "word"),
+    ("⌫", "undo"), ("ctrl+c", "quit"),
 ]
 HELP_TASK = [
     ("↑↓", "nav"), ("shift+↑↓", "move"), ("space", "done"),
-    ("tab", "status"), ("⏎", "notes"), ("→", "links"),
-    ("c", "copy"), ("F2", "rename"), ("x", "del"), ("⌫", "undo"),
+    ("tab", "status"), ("⏎", "notes"), ("shift+⏎", "subtask"), ("→", "links"),
+    ("c", "copy"), ("F2", "rename"), ("ctrl+⌫", "del"), ("⌫", "undo"),
     ("q", "quit"),
 ]
-HELP_RENAME = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
+HELP_RENAME = [
+    ("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word"), ("ctrl+⌫", "clear/del"),
+]
 HELP_NOTES_ITEMS = [
     ("⏎", "newline"), ("ctrl+/", "clear"),
     ("esc", "save & close"),
@@ -47,6 +49,10 @@ INPUT_PLACEHOLDER = "New task..."
 
 TASK_PREFIX_LEN = 7  # " [x] · "
 TASK_INDENT = " " * TASK_PREFIX_LEN
+SUBTASK_PREFIX_LEN = 9  # "   [x]   " — indented two past a top-level task, no marker
+SUBTASK_INDENT = " " * SUBTASK_PREFIX_LEN
+TASK_STATUS_COL = 1  # column where a top-level "[x]" checkbox starts
+SUBTASK_STATUS_COL = 3  # ...and where an indented subtask's checkbox starts
 
 EDITOR_INDENT = "    "  # one indent level in the notes editor (Tab / Shift+Tab)
 
@@ -108,6 +114,9 @@ def db_connect():
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN status INTEGER NOT NULL DEFAULT 0"
             )
+        if "parent_id" not in cols:
+            # NULL parent_id = top-level task; otherwise the id of the parent task.
+            conn.execute("ALTER TABLE tasks ADD COLUMN parent_id INTEGER")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -129,35 +138,86 @@ def db_connect():
 
 
 def list_tasks(conn):
-    return conn.execute(
-        "SELECT id, title, notes, done, status FROM tasks "
-        "ORDER BY done ASC, position ASC, id ASC"
+    """Tasks in display order as (id, title, notes, done, status, parent_id) rows.
+
+    Top-level tasks (parent_id IS NULL) are ordered active-first then by position;
+    each is immediately followed by its subtasks in sibling-position order. A
+    subtask's own done-state never reorders it — it always sits under its parent."""
+    rows = conn.execute(
+        "SELECT id, title, notes, done, status, position, parent_id FROM tasks"
     ).fetchall()
+    children = {}
+    parents = []
+    for r in rows:
+        if r[6] is None:
+            parents.append(r)
+        else:
+            children.setdefault(r[6], []).append(r)
+    parents.sort(key=lambda r: (r[3], r[5], r[0]))  # done, position, id
+    for kids in children.values():
+        kids.sort(key=lambda r: (r[5], r[0]))  # position, id
+    # Public row shape drops `position` (index 5), keeping parent_id (index 6).
+    def public(r):
+        return (r[0], r[1], r[2], r[3], r[4], r[6])
+
+    ordered = []
+    for p in parents:
+        ordered.append(public(p))
+        ordered.extend(public(c) for c in children.get(p[0], ()))
+    return ordered
 
 
 def add_task(conn, title):
     with conn:
-        conn.execute("UPDATE tasks SET position = position + 1 WHERE done = 0")
         conn.execute(
-            "INSERT INTO tasks (title, notes, position, done) VALUES (?, '', 0, 0)",
+            "UPDATE tasks SET position = position + 1 "
+            "WHERE done = 0 AND parent_id IS NULL"
+        )
+        conn.execute(
+            "INSERT INTO tasks (title, notes, position, done, parent_id) "
+            "VALUES (?, '', 0, 0, NULL)",
             (title,),
         )
 
 
+def add_subtask(conn, parent_id, title=""):
+    """Append a new subtask under parent_id and return its id. Subtasks are
+    ordered among siblings by position and start not-done."""
+    with conn:
+        max_pos = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) FROM tasks WHERE parent_id=?",
+            (parent_id,),
+        ).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO tasks (title, notes, position, done, parent_id) "
+            "VALUES (?, '', ?, 0, ?)",
+            (title, max_pos + 1, parent_id),
+        )
+    return cur.lastrowid
+
+
 def delete_task(conn, task_id):
     row = conn.execute(
-        "SELECT position, done FROM tasks WHERE id=?", (task_id,)
+        "SELECT position, done, parent_id FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     if row is None:
         return
-    pos, done = row
+    pos, done, parent_id = row
     with conn:
-        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
-        conn.execute(
-            "UPDATE tasks SET position = position - 1 "
-            "WHERE position > ? AND done = ?",
-            (pos, done),
-        )
+        # Deleting a parent cascades to its subtasks.
+        conn.execute("DELETE FROM tasks WHERE id=? OR parent_id=?", (task_id, task_id))
+        if parent_id is None:
+            conn.execute(
+                "UPDATE tasks SET position = position - 1 "
+                "WHERE position > ? AND done = ? AND parent_id IS NULL",
+                (pos, done),
+            )
+        else:
+            conn.execute(
+                "UPDATE tasks SET position = position - 1 "
+                "WHERE position > ? AND parent_id = ?",
+                (pos, parent_id),
+            )
 
 
 def update_title(conn, task_id, title):
@@ -172,16 +232,24 @@ def update_notes(conn, task_id, notes):
 
 def move_task(conn, task_id, direction):
     row = conn.execute(
-        "SELECT position, done FROM tasks WHERE id=?", (task_id,)
+        "SELECT position, done, parent_id FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     if row is None:
         return False
-    pos, done = row
+    pos, done, parent_id = row
     new_pos = pos + direction
-    swap = conn.execute(
-        "SELECT id FROM tasks WHERE position=? AND done=?",
-        (new_pos, done),
-    ).fetchone()
+    # Swap with the adjacent sibling: among top-level tasks of the same done-state,
+    # or among the same parent's subtasks (their done-state is irrelevant to order).
+    if parent_id is None:
+        swap = conn.execute(
+            "SELECT id FROM tasks WHERE position=? AND done=? AND parent_id IS NULL",
+            (new_pos, done),
+        ).fetchone()
+    else:
+        swap = conn.execute(
+            "SELECT id FROM tasks WHERE position=? AND parent_id=?",
+            (new_pos, parent_id),
+        ).fetchone()
     if swap is None:
         return False
     with conn:
@@ -192,28 +260,37 @@ def move_task(conn, task_id, direction):
 
 def toggle_done(conn, task_id):
     row = conn.execute(
-        "SELECT position, done FROM tasks WHERE id=?", (task_id,)
+        "SELECT position, done, parent_id FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
     if row is None:
         return
-    pos, done = row
+    pos, done, parent_id = row
     new_done = 1 - done
+    if parent_id is not None:
+        # A subtask just flips in place — it never leaves its parent's group.
+        with conn:
+            conn.execute(
+                "UPDATE tasks SET done=? WHERE id=?", (new_done, task_id)
+            )
+        return
     with conn:
         conn.execute(
             "UPDATE tasks SET position = position - 1 "
-            "WHERE position > ? AND done = ?",
+            "WHERE position > ? AND done = ? AND parent_id IS NULL",
             (pos, done),
         )
         if new_done:
             # Completed tasks enqueue from the top, like new tasks.
             conn.execute(
-                "UPDATE tasks SET position = position + 1 WHERE done = 1"
+                "UPDATE tasks SET position = position + 1 "
+                "WHERE done = 1 AND parent_id IS NULL"
             )
             new_pos = 0
         else:
             # Re-opened tasks go to the bottom of the active list.
             max_new = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) FROM tasks WHERE done=0"
+                "SELECT COALESCE(MAX(position), -1) FROM tasks "
+                "WHERE done=0 AND parent_id IS NULL"
             ).fetchone()[0]
             new_pos = max_new + 1
         conn.execute(
@@ -237,7 +314,7 @@ def cycle_status(conn, task_id, direction=1):
 
 def snapshot(conn):
     return conn.execute(
-        "SELECT id, title, notes, position, done, status FROM tasks"
+        "SELECT id, title, notes, position, done, status, parent_id FROM tasks"
     ).fetchall()
 
 
@@ -245,8 +322,8 @@ def restore(conn, snap):
     with conn:
         conn.execute("DELETE FROM tasks")
         conn.executemany(
-            "INSERT INTO tasks (id, title, notes, position, done, status) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, title, notes, position, done, status, parent_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             snap,
         )
 
@@ -603,6 +680,24 @@ def set_bracketed_paste(enabled):
         pass
 
 
+def set_kitty_keyboard(enabled):
+    """Toggle the Kitty keyboard protocol's "disambiguate escape codes" flag.
+
+    With it on, keys that the legacy encoding can't distinguish are reported as
+    CSI-u escapes — notably Shift+Enter (ESC[13;2u), which we need for adding
+    subtasks. Plain Enter/Tab/Backspace keep their legacy bytes, but Ctrl+key
+    combos arrive as CSI-u too (e.g. Ctrl+W = ESC[119;5u), so _decode_csi_u maps
+    them back to their control bytes; a lone Esc becomes ESC[27u. We push the
+    flag on
+    enable and pop it on disable so the terminal's prior state is restored.
+    Terminals without the protocol ignore these sequences."""
+    try:
+        sys.stdout.write("\x1b[>1u" if enabled else "\x1b[<1u")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
 def hard_wrap(text, width):
     """Hard wrap (no word breaking). Returns list with at least one entry.
     Simple cursor math: line = cursor // width, col = cursor % width."""
@@ -721,22 +816,57 @@ def word_right(buf, cursor):
     return i
 
 
-# Tokens returned by decode_escape().
+# Tokens returned by decode_escape() (besides bare curses KEY_* constants).
 ESC_BARE = None
 ESC_OTHER = "other"
 ESC_ALT_BACKSPACE = "alt-backspace"
 ESC_WORD_LEFT = "word-left"
 ESC_WORD_RIGHT = "word-right"
 ESC_PASTE_START = "paste-start"  # ESC[200~ — body follows; read with read_paste
+ESC_SHIFT_ENTER = "shift-enter"  # ESC[13;2u under the Kitty keyboard protocol
+ESC_CTRL_BACKSPACE = "ctrl-backspace"  # ESC[127;5u under the Kitty keyboard protocol
+
+# Final byte -> navigation key for CSI/SS3 cursor sequences (ESC[A / ESCOA …).
+_CSI_NAV = {
+    "A": curses.KEY_UP, "B": curses.KEY_DOWN,
+    "C": curses.KEY_RIGHT, "D": curses.KEY_LEFT,
+    "H": curses.KEY_HOME, "F": curses.KEY_END,
+}
+# Leading param -> navigation key for CSI "~" sequences (ESC[5~ …).
+_CSI_TILDE_NAV = {
+    1: curses.KEY_HOME, 7: curses.KEY_HOME,
+    4: curses.KEY_END, 8: curses.KEY_END,
+    5: curses.KEY_PPAGE, 6: curses.KEY_NPAGE,
+    3: curses.KEY_DC, 2: curses.KEY_IC,
+}
+# Final byte -> function key for SS3/CSI sequences (ESCOQ / ESC[1;2Q = F2 …).
+_CSI_FUNC = {
+    "P": curses.KEY_F1, "Q": curses.KEY_F2,
+    "R": curses.KEY_F3, "S": curses.KEY_F4,
+}
+
+
+def _csi_int(field, default=0):
+    """Leading integer of a CSI parameter field (dropping any ':' sub-params)."""
+    head = field.split(":")[0]
+    return int(head) if head.isdigit() else default
+
+
+def _csi_modifiers(params):
+    """xterm/Kitty modifier value from a CSI param string ("1;3" -> 3). The
+    encoding is 1 + bitmask(shift=1, alt=2, ctrl=4); 1 means no modifiers."""
+    fields = params.split(";")
+    return _csi_int(fields[1], 1) if len(fields) > 1 else 1
 
 
 def decode_escape(stdscr):
     """Decode the bytes following an ESC that get_wch() already returned.
 
-    Returns one of the ESC_* tokens. Recognizes Option/Alt + Left/Right word
-    motion (xterm 'ESC [ 1 ; 3 D|C' and meta 'ESC b' / 'ESC f'), Alt+Backspace
-    ('ESC' + backspace), and a bare Escape (no bytes follow). Other escape
-    sequences are consumed and reported as ESC_OTHER."""
+    Returns a curses KEY_* constant for cursor/navigation keys — so they keep
+    working even when the terminal (e.g. under the Kitty keyboard protocol)
+    sends them as raw escape sequences that keypad() didn't fold into a KEY_* —
+    or one of the ESC_* tokens (word motion, Alt/Ctrl+Backspace, Shift+Enter,
+    paste start, bare Escape), or ESC_OTHER for anything unrecognized."""
     stdscr.nodelay(True)
     try:
         try:
@@ -763,15 +893,80 @@ def decode_escape(stdscr):
                     final = nxt
                     break
                 params.append(nxt if isinstance(nxt, str) else "")
-            if c == "[" and final == "~" and "".join(params) == "200":
-                return ESC_PASTE_START
-            if final in ("C", "D"):
-                mod = "".join(params).split(";")[-1]
-                if mod == "3":  # Alt / Option
-                    return ESC_WORD_RIGHT if final == "C" else ESC_WORD_LEFT
+            return _decode_csi(c, "".join(params), final)
         return ESC_OTHER
     finally:
         stdscr.nodelay(False)
+
+
+def _decode_csi(intro, params, final):
+    """Map a parsed CSI/SS3 sequence (intro '[' or 'O', joined params, final
+    byte) to a KEY_* constant or ESC_* token."""
+    if final is None:
+        return ESC_OTHER
+    if final == "~":
+        first = params.split(";")[0]
+        if intro == "[" and first == "200":
+            return ESC_PASTE_START
+        return _CSI_TILDE_NAV.get(_csi_int(first), ESC_OTHER)
+    if final == "u" and intro == "[":
+        return _decode_csi_u(params)
+    if final == "Z":  # Shift+Tab (CSI Z, the legacy back-tab)
+        return curses.KEY_BTAB
+    if final in _CSI_FUNC:  # F1–F4 (ESCOP… or ESC[1;2P…)
+        return _CSI_FUNC[final]
+    if final in _CSI_NAV:
+        mods = _csi_modifiers(params)
+        shift, alt = (mods - 1) & 1, (mods - 1) & 2
+        if alt and final == "C":
+            return ESC_WORD_RIGHT
+        if alt and final == "D":
+            return ESC_WORD_LEFT
+        if shift and final == "A":
+            return curses.KEY_SR  # Shift+Up -> move task up
+        if shift and final == "B":
+            return curses.KEY_SF  # Shift+Down -> move task down
+        return _CSI_NAV[final]
+    return ESC_OTHER
+
+
+def _decode_csi_u(params):
+    """Decode a Kitty keyboard-protocol "keycode;modifiers" sequence (ESC[…u).
+
+    Under the protocol's disambiguate flag many modified keys that legacy
+    encodings can't express arrive here instead of as their old bytes, so this
+    maps the ones the app binds back to the same KEY_*/ESC_* values."""
+    fields = params.split(";")
+    keycode = _csi_int(fields[0])
+    mods = _csi_int(fields[1], 1) if len(fields) > 1 else 1
+    shift, alt, ctrl = (mods - 1) & 1, (mods - 1) & 2, (mods - 1) & 4
+    if keycode == 27:  # lone Esc is reported as ESC[27u
+        return ESC_BARE
+    if keycode == 13 and shift:  # Shift+Enter -> add subtask
+        return ESC_SHIFT_ENTER
+    if keycode == 9 and shift:  # Shift+Tab -> back-tab
+        return curses.KEY_BTAB
+    if keycode in (8, 127):  # Backspace
+        if ctrl:
+            return ESC_CTRL_BACKSPACE  # delete task
+        if alt:
+            return ESC_ALT_BACKSPACE  # delete word back
+    if alt and keycode in (ord("b"), ord("B")):
+        return ESC_WORD_LEFT  # Option+b
+    if alt and keycode in (ord("f"), ord("F")):
+        return ESC_WORD_RIGHT  # Option+f
+    if alt and keycode in (ord("w"), ord("W")):
+        return ESC_ALT_BACKSPACE  # Option+w -> delete word back
+    if ctrl and not alt:
+        # Ctrl+key arrives here as a CSI-u sequence under the Kitty protocol
+        # rather than as its legacy control byte. Reconstruct that byte so the
+        # app's existing CTRL_* handlers (Ctrl+W word-delete, Ctrl+C quit) fire.
+        # keycode is the unshifted codepoint, so 'w'->119 gives chr(23)='\x17'.
+        if ord("a") <= keycode <= ord("z"):
+            return chr(keycode - ord("a") + 1)
+        if keycode == ord("/"):
+            return CTRL_SLASH  # Ctrl+/ -> clear note (legacy byte 0x1f)
+    return ESC_OTHER
 
 
 def read_paste(stdscr):
@@ -1098,17 +1293,20 @@ def edit_notes(stdscr, conn, title, initial_text, status=STATUS_NONE):
             if ch == "\x03":
                 return result()
             if ch == "\x1b":
-                tok = decode_escape(stdscr)
-                if tok is ESC_BARE:
-                    return result()
-                if tok == ESC_PASTE_START:
-                    insert_paste(read_paste(stdscr))
-                elif tok == ESC_ALT_BACKSPACE:
-                    editor_word_delete_back(buf)
-                elif tok == ESC_WORD_LEFT:
-                    editor_word_left(buf)
-                elif tok == ESC_WORD_RIGHT:
-                    editor_word_right(buf)
+                ch = decode_escape(stdscr)
+            if ch is ESC_BARE:
+                return result()
+            if ch == ESC_PASTE_START:
+                insert_paste(read_paste(stdscr))
+                continue
+            if ch == ESC_ALT_BACKSPACE:
+                editor_word_delete_back(buf)
+                continue
+            if ch == ESC_WORD_LEFT:
+                editor_word_left(buf)
+                continue
+            if ch == ESC_WORD_RIGHT:
+                editor_word_right(buf)
                 continue
             if ch == curses.KEY_RESIZE:
                 continue
@@ -1116,6 +1314,8 @@ def edit_notes(stdscr, conn, title, initial_text, status=STATUS_NONE):
                 buf.lines = [""]
                 buf.cy = buf.cx = buf.scroll_y = 0
                 continue
+            # KEY_* (incl. arrows decoded from raw escapes) and plain chars; any
+            # other ESC_* sentinel falls through and is ignored by the editor.
             editor_handle_key(buf, ch, w)
     finally:
         set_bracketed_paste(False)
@@ -1183,10 +1383,9 @@ def pick_link(stdscr, title, links, status=STATUS_NONE):
         if ch == "\x03":
             return
         if ch == "\x1b":
-            tok = decode_escape(stdscr)
-            if tok is ESC_BARE:
-                return
-            continue
+            ch = decode_escape(stdscr)
+        if ch is ESC_BARE:
+            return
         if ch in (curses.KEY_UP, "k"):
             sel = (sel - 1) % len(links)
         elif ch in (curses.KEY_DOWN, "j"):
@@ -1221,30 +1420,38 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
     row of the renamed task, or None when not renaming."""
     rows = []
     rename_pos = None
+    # The active/completed gap is driven by top-level tasks only: a done subtask
+    # under an active parent must not pull the divider up above its parent.
     split_idx = next(
-        (i for i, t in enumerate(tasks) if t[3] == 1), len(tasks)
+        (i for i, t in enumerate(tasks) if t[5] is None and t[3] == 1), len(tasks)
     )
-    avail = max(1, w - TASK_PREFIX_LEN)
     for i, task in enumerate(tasks):
         if i == split_idx and i > 0:
             rows.append({"kind": "gap", "task_idx": None, "text": "", "attr": 0})
-        _tid, title, notes, done, status = task
+        _tid, title, notes, done, status, parent_id = task
+        is_sub = parent_id is not None
+        prefix_len = SUBTASK_PREFIX_LEN if is_sub else TASK_PREFIX_LEN
+        cont_indent = SUBTASK_INDENT if is_sub else TASK_INDENT
+        status_col = SUBTASK_STATUS_COL if is_sub else TASK_STATUS_COL
+        avail = max(1, w - prefix_len)
         if rename_idx == i and rename_text is not None:
             title = rename_text
         checkbox = "[x]" if done else "[ ]"
-        marker = "·" if notes else " "
         if rename_idx == i and rename_text is not None:
             title_lines, cur_row, cur_col = word_wrap_line(
                 title, avail, rename_cursor
             )
-            rename_pos = (cur_row, TASK_PREFIX_LEN + cur_col)
+            rename_pos = (cur_row, prefix_len + cur_col)
         else:
             title_lines, _cr, _cc = word_wrap_line(title, avail)
         for j, line in enumerate(title_lines):
-            if j == 0:
-                prefix = " " + checkbox + " " + marker + " "
+            if j > 0:
+                prefix = cont_indent
+            elif is_sub:
+                prefix = "   " + checkbox + "   "  # no notes marker on subtasks
             else:
-                prefix = TASK_INDENT
+                marker = "·" if notes else " "
+                prefix = " " + checkbox + " " + marker + " "
             attr = curses.A_DIM if done else curses.A_NORMAL
             rows.append(
                 {
@@ -1253,6 +1460,7 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
                     "text": prefix + line,
                     "attr": attr,
                     "status": status if j == 0 else STATUS_NONE,
+                    "status_col": status_col if j == 0 else None,
                 }
             )
     return rows, rename_pos
@@ -1348,7 +1556,10 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
         status_cp = STATUS_COLOR_PAIR.get(r.get("status", STATUS_NONE), 0)
         if status_cp:
             try:
-                stdscr.chgat(task_area_start + i, 1, 3, curses.color_pair(status_cp))
+                stdscr.chgat(
+                    task_area_start + i, r.get("status_col") or TASK_STATUS_COL, 3,
+                    curses.color_pair(status_cp),
+                )
             except curses.error:
                 pass
         if (
@@ -1466,6 +1677,7 @@ def run(stdscr):
     curses.init_pair(LINK_SEL_LAST_PAIR, pal["green"], sel_bg)
     set_cursor(False)
     stdscr.keypad(True)
+    set_kitty_keyboard(True)
 
     conn = db_connect()
     tasks = list_tasks(conn)
@@ -1479,6 +1691,7 @@ def run(stdscr):
     rename_buf = []
     rename_cursor = 0
     rename_target_id = None
+    rename_is_new = False  # renaming a just-created subtask (delete if left empty)
 
     undo_stack = []
 
@@ -1503,9 +1716,21 @@ def run(stdscr):
         prune_pastes(conn, keep)
 
     def commit_rename():
-        nonlocal renaming, rename_buf, rename_cursor, rename_target_id, tasks
+        nonlocal renaming, rename_buf, rename_cursor, rename_target_id
+        nonlocal rename_is_new, tasks
         new_title = "".join(rename_buf).strip()
-        if rename_target_id is not None and new_title:
+        if rename_is_new:
+            # A just-created subtask: keep it only if it was given a title,
+            # otherwise drop it along with the undo entry from its creation
+            # (so creating + naming a subtask is a single, clean undo step).
+            if new_title:
+                update_title(conn, rename_target_id, new_title)
+            else:
+                delete_task(conn, rename_target_id)
+                if undo_stack:
+                    undo_stack.pop()
+            tasks = list_tasks(conn)
+        elif rename_target_id is not None and new_title:
             row = next(
                 (t for t in tasks if t[0] == rename_target_id), None
             )
@@ -1517,6 +1742,7 @@ def run(stdscr):
         rename_buf = []
         rename_cursor = 0
         rename_target_id = None
+        rename_is_new = False
 
     try:
         while True:
@@ -1531,28 +1757,50 @@ def run(stdscr):
             )
 
             ch = stdscr.get_wch()
+            # Decode escape sequences once, up front: navigation keys become the
+            # matching curses KEY_* constants (so they work even when the Kitty
+            # protocol makes the terminal send them as raw escapes), the rest
+            # become ESC_* tokens. Everything below dispatches on the result.
+            if ch == "\x1b":
+                ch = decode_escape(stdscr)
 
             # --- RENAME MODE ---
             if renaming:
-                if ch == "\n" or ch == "\r":
+                if ch == "\n" or ch == "\r" or ch is ESC_BARE:
                     commit_rename()
-                    continue
-                if ch == "\x1b":
-                    tok = decode_escape(stdscr)
-                    if tok is ESC_BARE:
-                        commit_rename()
-                    elif tok == ESC_ALT_BACKSPACE:
-                        rename_cursor = delete_word_back(rename_buf, rename_cursor)
-                    elif tok == ESC_WORD_LEFT:
-                        rename_cursor = word_left(rename_buf, rename_cursor)
-                    elif tok == ESC_WORD_RIGHT:
-                        rename_cursor = word_right(rename_buf, rename_cursor)
                     continue
                 if ch == "\x03":
                     commit_rename()
                     break
-                if ch == CTRL_W:
+                if ch == ESC_CTRL_BACKSPACE:
+                    if rename_buf:
+                        rename_buf = []  # clear the title text
+                        rename_cursor = 0
+                    else:
+                        # Already empty: delete the item and leave edit mode.
+                        target = rename_target_id
+                        was_new = rename_is_new
+                        renaming = False
+                        rename_buf = []
+                        rename_cursor = 0
+                        rename_target_id = None
+                        rename_is_new = False
+                        if target is not None:
+                            if was_new:
+                                if undo_stack:  # creation already pushed an undo
+                                    undo_stack.pop()
+                            else:
+                                push_undo()
+                            delete_task(conn, target)
+                            tasks = list_tasks(conn)
+                            selected = 0 if not tasks else min(selected, len(tasks))
+                    continue
+                if ch == CTRL_W or ch == ESC_ALT_BACKSPACE:
                     rename_cursor = delete_word_back(rename_buf, rename_cursor)
+                elif ch == ESC_WORD_LEFT:
+                    rename_cursor = word_left(rename_buf, rename_cursor)
+                elif ch == ESC_WORD_RIGHT:
+                    rename_cursor = word_right(rename_buf, rename_cursor)
                 elif is_backspace(ch):
                     if rename_cursor > 0:
                         del rename_buf[rename_cursor - 1]
@@ -1613,18 +1861,15 @@ def run(stdscr):
                         tasks = list_tasks(conn)
                         input_buf = []
                         input_cursor = 0
-                elif ch == "\x1b":
-                    tok = decode_escape(stdscr)
-                    if tok is ESC_BARE:
-                        input_buf = []
-                        input_cursor = 0
-                    elif tok == ESC_ALT_BACKSPACE:
-                        input_cursor = delete_word_back(input_buf, input_cursor)
-                    elif tok == ESC_WORD_LEFT:
-                        input_cursor = word_left(input_buf, input_cursor)
-                    elif tok == ESC_WORD_RIGHT:
-                        input_cursor = word_right(input_buf, input_cursor)
-                elif ch == CTRL_W:
+                elif ch is ESC_BARE:
+                    # Move focus to the first task, like pressing Down once.
+                    if tasks:
+                        selected = 1
+                elif ch == ESC_WORD_LEFT:
+                    input_cursor = word_left(input_buf, input_cursor)
+                elif ch == ESC_WORD_RIGHT:
+                    input_cursor = word_right(input_buf, input_cursor)
+                elif ch == CTRL_W or ch == ESC_ALT_BACKSPACE:
                     input_cursor = delete_word_back(input_buf, input_cursor)
                 elif is_backspace(ch):
                     if input_buf:
@@ -1651,7 +1896,7 @@ def run(stdscr):
                 if task_idx >= len(tasks):
                     selected = len(tasks)
                     continue
-                tid, title, notes, _done, status = tasks[task_idx]
+                tid, title, notes, _done, status, parent_id = tasks[task_idx]
 
                 if ch == "q" or ch == "Q":
                     break
@@ -1698,7 +1943,9 @@ def run(stdscr):
                     push_undo()
                     cycle_status(conn, tid, -1)
                     tasks = list_tasks(conn)
-                elif ch == "\n" or ch == "\r":
+                elif (ch == "\n" or ch == "\r") and parent_id is None:
+                    # Subtasks have no notes, so Enter only opens the editor for
+                    # top-level tasks.
                     new = edit_notes(stdscr, conn, title, notes, status)
                     if new is not None and new != notes:
                         push_undo()
@@ -1731,7 +1978,7 @@ def run(stdscr):
                     rename_buf = list(title)
                     rename_cursor = len(rename_buf)
                     rename_target_id = tid
-                elif ch == "x" or ch == "X" or ch == curses.KEY_DC:
+                elif ch == ESC_CTRL_BACKSPACE or ch == curses.KEY_DC:
                     push_undo()
                     delete_task(conn, tid)
                     tasks = list_tasks(conn)
@@ -1744,11 +1991,28 @@ def run(stdscr):
                     if sel is not None:
                         tasks = list_tasks(conn)
                         selected = max(0, min(sel, len(tasks)))
-                elif ch == "\x1b":
-                    decode_escape(stdscr)
+                elif ch == ESC_SHIFT_ENTER:
+                    # Add a subtask: under this task, or as a sibling if this
+                    # row is already a subtask (single-level nesting).
+                    parent = parent_id if parent_id is not None else tid
+                    push_undo()
+                    new_id = add_subtask(conn, parent)
+                    tasks = list_tasks(conn)
+                    new_idx = next(
+                        (i for i, t in enumerate(tasks) if t[0] == new_id), None
+                    )
+                    if new_idx is not None:
+                        selected = new_idx + 1
+                    # Drop straight into inline rename to title the subtask.
+                    renaming = True
+                    rename_buf = []
+                    rename_cursor = 0
+                    rename_target_id = new_id
+                    rename_is_new = True
                 elif ch == curses.KEY_RESIZE:
                     pass
     finally:
+        set_kitty_keyboard(False)
         conn.close()
 
 
