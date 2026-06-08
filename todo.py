@@ -8,13 +8,21 @@ import plistlib
 import re
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 locale.setlocale(locale.LC_ALL, "")
 
 DB_PATH = Path.home() / ".todo.db"
 BACKSPACE_KEYS = (curses.KEY_BACKSPACE, "\x7f", "\x08")
 UNDO_DEPTH = 100
+
+# A paste of at least this many lines collapses to a "[Pasted text #N +M lines]"
+# placeholder in the notes editor; the full text is stashed in the `pastes`
+# table and restored on copy. Smaller pastes are inserted verbatim.
+PASTE_COLLAPSE_LINES = 4
+PASTE_RE = re.compile(r"\[Pasted text #(\d+) \+\d+ lines?\]")
 
 HELP_INPUT = [
     ("⏎", "add"), ("↓", "tasks"), ("ctrl+w", "word"),
@@ -28,10 +36,10 @@ HELP_TASK = [
 ]
 HELP_RENAME = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
 HELP_NOTES_ITEMS = [
-    ("⏎", "newline"), ("tab", "indent"), ("⇧tab", "dedent"),
+    ("⏎", "newline"), ("ctrl+/", "clear"),
     ("esc", "save & close"),
 ]
-HELP_LINKS_ITEMS = [("↑↓", "nav"), ("⏎/o", "open"), ("esc/←", "back")]
+HELP_LINKS_ITEMS = [("↑↓", "nav"), ("⏎/→", "open"), ("esc/←", "back")]
 
 INPUT_PREFIX = " + "
 INPUT_INDENT = "   "
@@ -49,6 +57,7 @@ HEADING_PLAIN_LEAD = "──"  # heading lead-in for an unfocused panel
 
 F2_KEY = curses.KEY_F0 + 2
 CTRL_W = "\x17"
+CTRL_SLASH = "\x1f"  # Ctrl+/ sends US (0x1f) — clears the whole note in the editor
 
 STATUS_NONE = 0
 STATUS_WIP = 1
@@ -59,6 +68,18 @@ STATUS_COUNT = 5
 STATUS_COLOR_PAIR = {
     STATUS_NONE: 0, STATUS_WIP: 1, STATUS_PR: 2, STATUS_MERGED: 3, STATUS_WONT: 4,
 }
+
+# Color pairs for rendering links in the links picker: the host/domain, the
+# alternating path segments, and the emphasized final path segment.
+LINK_HOST_COLOR_PAIR = 5
+LINK_SEG_ALT_COLOR_PAIR = 6
+LINK_LAST_COLOR_PAIR = 7
+# Selected-row variants: the same foreground colors over a solid highlight
+# background, plus a base (default-fg) pair used to fill the whole row.
+LINK_SEL_BASE_PAIR = 8
+LINK_SEL_HOST_PAIR = 9
+LINK_SEL_ALT_PAIR = 10
+LINK_SEL_LAST_PAIR = 11
 
 
 # --- Database ---
@@ -92,6 +113,14 @@ def db_connect():
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pastes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL
             )
             """
         )
@@ -175,11 +204,18 @@ def toggle_done(conn, task_id):
             "WHERE position > ? AND done = ?",
             (pos, done),
         )
-        max_new = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) FROM tasks WHERE done=?",
-            (new_done,),
-        ).fetchone()[0]
-        new_pos = max_new + 1
+        if new_done:
+            # Completed tasks enqueue from the top, like new tasks.
+            conn.execute(
+                "UPDATE tasks SET position = position + 1 WHERE done = 1"
+            )
+            new_pos = 0
+        else:
+            # Re-opened tasks go to the bottom of the active list.
+            max_new = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) FROM tasks WHERE done=0"
+            ).fetchone()[0]
+            new_pos = max_new + 1
         conn.execute(
             "UPDATE tasks SET done=?, position=? WHERE id=?",
             (new_done, new_pos, task_id),
@@ -213,6 +249,66 @@ def restore(conn, snap):
             "VALUES (?, ?, ?, ?, ?, ?)",
             snap,
         )
+
+
+# --- Pasted text ---
+#
+# Large multi-line pastes are kept out of the notes body: the full text is
+# stashed in `pastes` and the body holds a "[Pasted text #N +M lines]"
+# placeholder (N is the paste's row id). expand_pastes() reverses this for copy
+# and link detection so the user always gets the real content; prune_pastes()
+# drops rows whose placeholder has been edited away or deleted.
+
+def store_paste(conn, content):
+    with conn:
+        cur = conn.execute("INSERT INTO pastes (content) VALUES (?)", (content,))
+    return cur.lastrowid
+
+
+def get_paste(conn, paste_id):
+    row = conn.execute(
+        "SELECT content FROM pastes WHERE id=?", (paste_id,)
+    ).fetchone()
+    return row[0] if row else None
+
+
+def paste_placeholder(paste_id, line_count):
+    return f"[Pasted text #{paste_id} +{line_count} lines]"
+
+
+def expand_pastes(conn, text):
+    """Replace each paste placeholder with its stored content. Unknown ids
+    (orphaned/deleted pastes) are left as-is."""
+    if "[Pasted text #" not in text:
+        return text
+
+    def repl(m):
+        content = get_paste(conn, int(m.group(1)))
+        return content if content is not None else m.group(0)
+
+    return PASTE_RE.sub(repl, text)
+
+
+def referenced_paste_ids(texts):
+    """Set of paste ids still referenced by a placeholder in any of `texts`."""
+    ids = set()
+    for t in texts:
+        for m in PASTE_RE.finditer(t):
+            ids.add(int(m.group(1)))
+    return ids
+
+
+def prune_pastes(conn, keep_ids):
+    """Delete stored pastes whose id is not in keep_ids."""
+    with conn:
+        if keep_ids:
+            marks = ",".join("?" * len(keep_ids))
+            conn.execute(
+                f"DELETE FROM pastes WHERE id NOT IN ({marks})",
+                tuple(keep_ids),
+            )
+        else:
+            conn.execute("DELETE FROM pastes")
 
 
 # --- UI helpers ---
@@ -284,14 +380,148 @@ def _unescape_path(token):
     return re.sub(r'\\(.)', r'\1', token).rstrip(_URL_TRAILING)
 
 
+# Query params that are pure tracking noise — dropped from URLs in the links view.
+_TRACKING_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "utm_name", "utm_reader", "utm_social", "utm_brand",
+    "utm_pubreferrer", "gclid", "gclsrc", "dclid", "gbraid", "wbraid",
+    "fbclid", "msclkid", "yclid", "twclid", "igshid", "igsh",
+    "mc_cid", "mc_eid", "mkt_tok", "_hsenc", "_hsmi", "vero_id", "vero_conv",
+    "oly_anon_id", "oly_enc_id", "ck_subscriber_id", "spm",
+}
+
+
+def _is_http(s):
+    return s.startswith(("http://", "https://"))
+
+
+def _redirect_target(host, path, qs):
+    """If (host, path) is a known link-redirector wrapper, return the embedded
+    destination URL carried in its query string, else None."""
+    host = host.lower()
+
+    def param(name):
+        for k, v in qs:
+            if k == name and _is_http(v):
+                return v
+        return None
+
+    if host in ("www.google.com", "google.com") and path == "/url":
+        return param("q") or param("url")
+    if host.endswith(".safelinks.protection.outlook.com"):
+        return param("url")
+    if host in ("l.facebook.com", "lm.facebook.com") and path == "/l.php":
+        return param("u")
+    if host in ("l.instagram.com", "l.messenger.com"):
+        return param("u")
+    if host == "out.reddit.com":
+        return param("url")
+    if host == "www.youtube.com" and path == "/redirect":
+        return param("q")
+    if host == "www.linkedin.com" and path.startswith("/redir/"):
+        return param("url")
+    return None
+
+
+def clean_url(url):
+    """Normalize an http(s) URL for the links view: unwrap known redirector
+    wrappers (so the real destination shows) and drop tracking query params.
+    Non-URL targets (file paths) are returned unchanged."""
+    if not _is_http(url):
+        return url
+    for _ in range(5):  # unwrap nested wrappers, bounded to avoid loops
+        parts = urlsplit(url)
+        nxt = _redirect_target(
+            parts.netloc, parts.path,
+            parse_qsl(parts.query, keep_blank_values=True),
+        )
+        if not nxt or nxt == url:
+            break
+        url = nxt
+    parts = urlsplit(url)
+    kept = [
+        (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+        if k.lower() not in _TRACKING_PARAMS
+    ]
+    return urlunsplit((
+        parts.scheme, parts.netloc, parts.path,
+        urlencode(kept), parts.fragment,
+    ))
+
+
+def display_link(target):
+    """Human-readable rendering of a link for the picker: https URLs with the
+    scheme and a leading 'www.' dropped, http URLs kept intact (so insecure
+    links stay obvious), percent-decoding undone, and file paths with the home
+    directory collapsed back to ~."""
+    if target.startswith("https://"):
+        return unquote(re.sub(r'^https://(www\.)?', '', target))
+    if target.startswith("http://"):
+        return unquote(target)
+    home = os.path.expanduser("~")
+    if target == home or target.startswith(home + os.sep):
+        return "~" + target[len(home):]
+    return target
+
+
+def link_spans(display, is_url):
+    """Split a display link into (text, role) spans for colored rendering.
+
+    Roles: 'scheme' (a kept 'http://'), 'host' (the URL domain), 'sep' (a '/'),
+    'seg'/'seg_alt' (alternating path pieces), 'last' (the final path piece,
+    emphasized), and 'query' (everything from the first '?' or '#')."""
+    spans = []
+    rest = display
+    if is_url:
+        m = re.match(r'[a-z][a-z0-9+.-]*://', rest)
+        if m:
+            spans.append((m.group(), "scheme"))
+            rest = rest[m.end():]
+
+    cut = len(rest)
+    for mark in ("?", "#"):
+        i = rest.find(mark)
+        if i != -1:
+            cut = min(cut, i)
+    main, tail = rest[:cut], rest[cut:]
+
+    parts = main.split("/")
+    path_start = 1 if is_url else 0  # index 0 is the host for URLs
+    last_idx = next(
+        (j for j in range(len(parts) - 1, path_start - 1, -1) if parts[j]),
+        None,
+    )
+    alt = 0
+    for idx, part in enumerate(parts):
+        if idx > 0:
+            spans.append(("/", "sep"))
+        if not part:
+            continue
+        if is_url and idx == 0:
+            spans.append((part, "host"))
+        elif idx == last_idx:
+            spans.append((part, "last"))
+        else:
+            spans.append((part, "seg" if alt % 2 == 0 else "seg_alt"))
+            alt += 1
+    if tail:
+        spans.append((tail, "query"))
+    return spans
+
+
 def find_links(*texts):
     """De-duplicated, openable links found in the texts, in appearance order.
 
     Detects http(s) URLs and local file paths (absolute or ~-relative,
     including drag-and-dropped paths with backslash-escaped spaces). A file
-    path is included only when it currently exists on disk, which also filters
-    out the slashes inside URLs. The returned file targets are unescaped and
-    ~-expanded so they can be handed straight to `open`."""
+    path is included only when it points at an existing regular file — this
+    keeps incidental slashes (e.g. '//' in code comments, which resolve to the
+    filesystem root) and the slashes inside URLs from being treated as links.
+    URLs are run through clean_url() so redirector wrappers are unwrapped and
+    tracking params dropped.
+
+    Returns a list of (display, target) pairs: `target` is what to hand to
+    `open`, `display` is the readable string to show in the picker."""
     links = []
     seen = set()
     for text in texts:
@@ -299,16 +529,16 @@ def find_links(*texts):
         for m in _URL_RE.finditer(text):
             url = m.group().rstrip(_URL_TRAILING)
             if url:
-                matches.append((m.start(), url))
+                matches.append((m.start(), clean_url(url)))
         for m in _FILE_RE.finditer(text):
             target = os.path.expanduser(_unescape_path(m.group()))
-            if target and os.path.lexists(target):
+            if target and os.path.isfile(target):
                 matches.append((m.start(), target))
         matches.sort(key=lambda it: it[0])
         for _pos, target in matches:
             if target not in seen:
                 seen.add(target)
-                links.append(target)
+                links.append((display_link(target), target))
     return links
 
 
@@ -359,6 +589,17 @@ def set_cursor(visible):
     try:
         curses.curs_set(1 if visible else 0)
     except curses.error:
+        pass
+
+
+def set_bracketed_paste(enabled):
+    """Toggle the terminal's bracketed-paste mode. When on, pasted text is
+    wrapped in ESC[200~ … ESC[201~ so it can be told apart from typing.
+    Terminals that don't support it ignore the sequence."""
+    try:
+        sys.stdout.write("\x1b[?2004h" if enabled else "\x1b[?2004l")
+        sys.stdout.flush()
+    except (OSError, ValueError):
         pass
 
 
@@ -486,6 +727,7 @@ ESC_OTHER = "other"
 ESC_ALT_BACKSPACE = "alt-backspace"
 ESC_WORD_LEFT = "word-left"
 ESC_WORD_RIGHT = "word-right"
+ESC_PASTE_START = "paste-start"  # ESC[200~ — body follows; read with read_paste
 
 
 def decode_escape(stdscr):
@@ -521,6 +763,8 @@ def decode_escape(stdscr):
                     final = nxt
                     break
                 params.append(nxt if isinstance(nxt, str) else "")
+            if c == "[" and final == "~" and "".join(params) == "200":
+                return ESC_PASTE_START
             if final in ("C", "D"):
                 mod = "".join(params).split(";")[-1]
                 if mod == "3":  # Alt / Option
@@ -528,6 +772,32 @@ def decode_escape(stdscr):
         return ESC_OTHER
     finally:
         stdscr.nodelay(False)
+
+
+def read_paste(stdscr):
+    """Read a bracketed-paste body up to the ESC[201~ terminator (the ESC[200~
+    opener has already been consumed by decode_escape). Returns the pasted text
+    with newlines normalized to '\\n'."""
+    out = []
+    while True:
+        try:
+            c = stdscr.get_wch()
+        except curses.error:
+            break
+        if c == "\x1b":
+            # The ESC[201~ terminator (or any stray escape): consume the rest of
+            # the control sequence up to its final byte and stop.
+            for _ in range(8):
+                try:
+                    n = stdscr.get_wch()
+                except curses.error:
+                    break
+                if isinstance(n, str) and (n == "~" or n.isalpha()):
+                    break
+            break
+        if isinstance(c, str):
+            out.append(c)
+    return "".join(out).replace("\r\n", "\n").replace("\r", "\n")
 
 
 # --- Text editor core ---
@@ -663,6 +933,27 @@ def editor_word_right(buf):
     buf.cx = word_right(line, buf.cx)
 
 
+def editor_insert_text(buf, text):
+    """Insert literal text (possibly containing newlines) at the cursor,
+    leaving the cursor just past the inserted text."""
+    if not text:
+        return
+    parts = text.split("\n")
+    line = buf.lines[buf.cy]
+    before, after = line[: buf.cx], line[buf.cx:]
+    if len(parts) == 1:
+        buf.lines[buf.cy] = before + parts[0] + after
+        buf.cx += len(parts[0])
+        return
+    buf.lines[buf.cy] = before + parts[0]
+    new_lines = parts[1:]
+    new_lines[-1] = new_lines[-1] + after
+    for k, nl in enumerate(new_lines):
+        buf.lines.insert(buf.cy + 1 + k, nl)
+    buf.cy += len(parts) - 1
+    buf.cx = len(parts[-1])
+
+
 def editor_handle_key(buf, ch, width):
     """Apply one content/navigation keystroke to buf at the given wrap width.
 
@@ -754,15 +1045,28 @@ def editor_handle_key(buf, ch, width):
 
 # --- Notes editor ---
 
-def edit_notes(stdscr, title, initial_text, status=STATUS_NONE):
+def edit_notes(stdscr, conn, title, initial_text, status=STATUS_NONE):
     """Full-screen editor for a task's notes. Esc/Ctrl-C save & close.
     Returns the edited text, or None if nothing changed."""
     original = initial_text
     buf = TextBuffer(initial_text)
     set_cursor(True)
+    set_bracketed_paste(True)
 
     def result():
         return None if buf.text == original else buf.text
+
+    def insert_paste(text):
+        """Collapse a sizable multi-line paste to a placeholder (stashing the
+        full text); insert smaller pastes verbatim."""
+        if not text:
+            return
+        lines = text.splitlines()
+        if len(lines) >= PASTE_COLLAPSE_LINES:
+            pid = store_paste(conn, text)
+            editor_insert_text(buf, paste_placeholder(pid, len(lines)))
+        else:
+            editor_insert_text(buf, text)
 
     try:
         while True:
@@ -797,7 +1101,9 @@ def edit_notes(stdscr, title, initial_text, status=STATUS_NONE):
                 tok = decode_escape(stdscr)
                 if tok is ESC_BARE:
                     return result()
-                if tok == ESC_ALT_BACKSPACE:
+                if tok == ESC_PASTE_START:
+                    insert_paste(read_paste(stdscr))
+                elif tok == ESC_ALT_BACKSPACE:
                     editor_word_delete_back(buf)
                 elif tok == ESC_WORD_LEFT:
                     editor_word_left(buf)
@@ -806,16 +1112,41 @@ def edit_notes(stdscr, title, initial_text, status=STATUS_NONE):
                 continue
             if ch == curses.KEY_RESIZE:
                 continue
+            if ch == CTRL_SLASH:  # clear the whole note (recoverable via undo on save)
+                buf.lines = [""]
+                buf.cy = buf.cx = buf.scroll_y = 0
+                continue
             editor_handle_key(buf, ch, w)
     finally:
+        set_bracketed_paste(False)
         set_cursor(False)
 
 
-def pick_link(stdscr, title, urls, status=STATUS_NONE):
-    """Modal list of links detected in a task. Up/down to navigate, enter/o to
-    open the selected link in the browser, esc/left to close."""
+def pick_link(stdscr, title, links, status=STATUS_NONE):
+    """Modal list of links detected in a task. `links` is a list of
+    (display, target) pairs. Up/down to navigate, enter/right to open the
+    selected link in the browser, esc/left to close."""
     sel = 0
     scroll = 0
+    role_attr = {
+        "scheme": curses.A_NORMAL,
+        "host": curses.color_pair(LINK_HOST_COLOR_PAIR) | curses.A_BOLD,
+        "sep": curses.A_DIM,
+        "seg": curses.A_NORMAL,
+        "seg_alt": curses.color_pair(LINK_SEG_ALT_COLOR_PAIR),
+        "last": curses.color_pair(LINK_LAST_COLOR_PAIR) | curses.A_BOLD,
+        "query": curses.A_DIM,
+    }
+    sel_base = curses.color_pair(LINK_SEL_BASE_PAIR)
+    sel_attr = {
+        "scheme": sel_base,
+        "host": curses.color_pair(LINK_SEL_HOST_PAIR) | curses.A_BOLD,
+        "sep": sel_base,
+        "seg": sel_base | curses.A_BOLD,
+        "seg_alt": curses.color_pair(LINK_SEL_ALT_PAIR) | curses.A_BOLD,
+        "last": curses.color_pair(LINK_SEL_LAST_PAIR) | curses.A_BOLD,
+        "query": sel_base,
+    }
     while True:
         h, w = stdscr.getmaxyx()
         stdscr.erase()
@@ -829,12 +1160,21 @@ def pick_link(stdscr, title, urls, status=STATUS_NONE):
 
         for i in range(list_h):
             idx = scroll + i
-            if idx >= len(urls):
+            if idx >= len(links):
                 break
+            display, target = links[idx]
             selected_row = idx == sel
-            marker = " · " if selected_row else "   "
-            attr = curses.A_BOLD if selected_row else curses.A_NORMAL
-            fill_line(stdscr, 1 + i, 0, w, marker + urls[idx], attr)
+            attrs = sel_attr if selected_row else role_attr
+            y = 1 + i
+            if selected_row:
+                fill_line(stdscr, y, 0, w, "", sel_base)  # solid highlight bar
+                safe_addstr(stdscr, y, 1, "·", sel_base | curses.A_BOLD)
+            x = 3
+            for text, role in link_spans(display, _is_http(target)):
+                if x >= w - 1:
+                    break
+                safe_addstr(stdscr, y, x, text, attrs[role])
+                x += len(text)
 
         render_help_bar(stdscr, h - 1, HELP_LINKS_ITEMS, w - 1)
         stdscr.refresh()
@@ -848,15 +1188,15 @@ def pick_link(stdscr, title, urls, status=STATUS_NONE):
                 return
             continue
         if ch in (curses.KEY_UP, "k"):
-            sel = (sel - 1) % len(urls)
+            sel = (sel - 1) % len(links)
         elif ch in (curses.KEY_DOWN, "j"):
-            sel = (sel + 1) % len(urls)
+            sel = (sel + 1) % len(links)
         elif ch == curses.KEY_HOME:
             sel = 0
         elif ch == curses.KEY_END:
-            sel = len(urls) - 1
-        elif ch in ("\n", "\r", "o", "O"):
-            open_link(urls[sel])
+            sel = len(links) - 1
+        elif ch in ("\n", "\r", curses.KEY_RIGHT):
+            open_link(links[sel][1])
         elif ch in (curses.KEY_LEFT, "q", "Q"):
             return
         elif ch == curses.KEY_RESIZE:
@@ -1060,32 +1400,70 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
     return scroll
 
 
+# Fixed RGB values for every color the UI paints, so the status boxes and link
+# text look identical no matter how the terminal's own color scheme is set up.
+# These are the exact values the UI has always rendered with (the Ghostty
+# default palette), just pinned down instead of borrowed from the terminal.
+PALETTE_RGB = {
+    "black": 0x1D1F21,
+    "yellow": 0xF0C674,
+    "green": 0xB5BD68,
+    "magenta": 0xB294BB,
+    "red": 0xCC6666,
+    "cyan": 0x8ABEB7,
+    "grey": 0x444444,  # selected-row highlight band in the links picker
+}
+
+
+def init_palette():
+    """Return a name->color-number map for the UI's colors.
+
+    When the terminal can redefine its palette (Ghostty and most modern
+    terminals can), install our exact RGB values into dedicated color slots so
+    the colors are device-independent. Otherwise fall back to the nearest named
+    ANSI colors, which the terminal's own theme will tint.
+    """
+    base = 16  # custom slots live above the standard 16 ANSI colors
+    if curses.can_change_color() and curses.COLORS >= base + len(PALETTE_RGB):
+        palette = {}
+        for slot, (name, hexval) in enumerate(PALETTE_RGB.items(), start=base):
+            r, g, b = (hexval >> 16) & 0xFF, (hexval >> 8) & 0xFF, hexval & 0xFF
+            curses.init_color(
+                slot, round(r * 1000 / 255), round(g * 1000 / 255), round(b * 1000 / 255)
+            )
+            palette[name] = slot
+        return palette
+    return {
+        "black": curses.COLOR_BLACK,
+        "yellow": curses.COLOR_YELLOW,
+        "green": curses.COLOR_GREEN,
+        "magenta": curses.COLOR_MAGENTA,
+        "red": curses.COLOR_RED,
+        "cyan": curses.COLOR_CYAN,
+        "grey": 238 if curses.COLORS >= 256 else curses.COLOR_BLUE,
+    }
+
+
 def run(stdscr):
     if hasattr(curses, "set_escdelay"):
         curses.set_escdelay(25)
     curses.start_color()
     curses.use_default_colors()
-    # Pin the chip palette to Ghostty's built-in default RGB values so the
-    # status colors look identical across platforms instead of inheriting each
-    # terminal's own palette (Windows console renders the named ANSI colors
-    # much darker/duller than Ghostty's pastel defaults). Values from Ghostty's
-    # default palette (src/terminal/color.zig), scaled from 0-255 to 0-1000.
-    if curses.can_change_color():
-        for color, (r, g, b) in (
-            (curses.COLOR_BLACK, (29, 31, 33)),     # #1D1F21
-            (curses.COLOR_RED, (204, 102, 102)),    # #CC6666
-            (curses.COLOR_GREEN, (181, 189, 104)),  # #B5BD68
-            (curses.COLOR_YELLOW, (240, 198, 116)), # #F0C674
-            (curses.COLOR_MAGENTA, (178, 148, 187)),# #B294BB
-        ):
-            try:
-                curses.init_color(color, r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
-            except curses.error:
-                pass
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_GREEN)
-    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
-    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_RED)
+    pal = init_palette()
+    curses.init_pair(1, pal["black"], pal["yellow"])
+    curses.init_pair(2, pal["black"], pal["green"])
+    curses.init_pair(3, pal["black"], pal["magenta"])
+    curses.init_pair(4, pal["black"], pal["red"])
+    curses.init_pair(LINK_HOST_COLOR_PAIR, pal["cyan"], -1)
+    curses.init_pair(LINK_SEG_ALT_COLOR_PAIR, pal["magenta"], -1)
+    curses.init_pair(LINK_LAST_COLOR_PAIR, pal["green"], -1)
+    # A subtle dark-grey band keeps the colored link text readable (a colored
+    # background like blue washes out cyan/green).
+    sel_bg = pal["grey"]
+    curses.init_pair(LINK_SEL_BASE_PAIR, -1, sel_bg)
+    curses.init_pair(LINK_SEL_HOST_PAIR, pal["cyan"], sel_bg)
+    curses.init_pair(LINK_SEL_ALT_PAIR, pal["magenta"], sel_bg)
+    curses.init_pair(LINK_SEL_LAST_PAIR, pal["green"], sel_bg)
     set_cursor(False)
     stdscr.keypad(True)
 
@@ -1115,6 +1493,14 @@ def run(stdscr):
         snap, sel = undo_stack.pop()
         restore(conn, snap)
         return sel
+
+    def prune_orphan_pastes():
+        # Keep pastes referenced by any current note or any undo snapshot, so a
+        # paste survives until its placeholder is gone for good (undo included).
+        keep = referenced_paste_ids(t[2] for t in tasks)
+        for snap, _sel in undo_stack:
+            keep |= referenced_paste_ids(r[2] for r in snap)
+        prune_pastes(conn, keep)
 
     def commit_rename():
         nonlocal renaming, rename_buf, rename_cursor, rename_target_id, tasks
@@ -1313,14 +1699,15 @@ def run(stdscr):
                     cycle_status(conn, tid, -1)
                     tasks = list_tasks(conn)
                 elif ch == "\n" or ch == "\r":
-                    new = edit_notes(stdscr, title, notes, status)
+                    new = edit_notes(stdscr, conn, title, notes, status)
                     if new is not None and new != notes:
                         push_undo()
                         update_notes(conn, tid, new)
                         tasks = list_tasks(conn)
+                        prune_orphan_pastes()
                 elif ch == "c" or ch == "C":
                     if notes:
-                        copy_to_clipboard(notes)
+                        copy_to_clipboard(expand_pastes(conn, notes))
                         for _ in range(2):
                             scroll = render_main(
                                 stdscr, tasks, selected, scroll,
@@ -1336,9 +1723,9 @@ def run(stdscr):
                             )
                             curses.napms(80)
                 elif ch == curses.KEY_RIGHT:
-                    urls = find_links(notes, title)
-                    if urls:
-                        pick_link(stdscr, title, urls, status)
+                    links = find_links(expand_pastes(conn, notes), title)
+                    if links:
+                        pick_link(stdscr, title, links, status)
                 elif ch == F2_KEY:
                     renaming = True
                     rename_buf = list(title)
