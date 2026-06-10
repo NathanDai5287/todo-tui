@@ -159,8 +159,9 @@ def list_tasks(conn):
     """Tasks in display order as (id, title, notes, done, status, parent_id) rows.
 
     Top-level tasks (parent_id IS NULL) are ordered active-first then by position;
-    each is immediately followed by its subtasks in sibling-position order. A
-    subtask's own done-state never reorders it — it always sits under its parent."""
+    each is immediately followed by its subtasks, active ones first then done
+    ones, each block in sibling-position order. A subtask always sits under its
+    parent; its done-state only moves it within the sibling list."""
     rows = conn.execute(
         "SELECT id, title, notes, done, status, position, parent_id FROM tasks"
     ).fetchall()
@@ -173,7 +174,7 @@ def list_tasks(conn):
             children.setdefault(r[6], []).append(r)
     parents.sort(key=lambda r: (r[3], r[5], r[0]))  # done, position, id
     for kids in children.values():
-        kids.sort(key=lambda r: (r[5], r[0]))  # position, id
+        kids.sort(key=lambda r: (r[3], r[5], r[0]))  # done, position, id
     # Public row shape drops `position` (index 5), keeping parent_id (index 6).
     def public(r):
         return (r[0], r[1], r[2], r[3], r[4], r[6])
@@ -202,7 +203,9 @@ def add_subtask(conn, parent_id, after_id=None, title=""):
     """Insert a new subtask under parent_id and return its id. It is placed
     directly after the sibling with id `after_id`, or at the front of the
     sibling list when after_id is None (e.g. just below the parent task);
-    following siblings shift down to make room. Subtasks start not-done."""
+    following siblings shift down to make room. Subtasks start not-done, so
+    insertion is clamped to the active/done boundary — anchoring on a done
+    sibling lands the new subtask at the bottom of the active block instead."""
     with conn:
         if after_id is None:
             pos = 0
@@ -212,6 +215,11 @@ def add_subtask(conn, parent_id, after_id=None, title=""):
                 (after_id, parent_id),
             ).fetchone()
             pos = (row[0] + 1) if row else 0
+        boundary = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE parent_id=? AND done=0",
+            (parent_id,),
+        ).fetchone()[0]
+        pos = min(pos, boundary)
         conn.execute(
             "UPDATE tasks SET position = position + 1 "
             "WHERE parent_id=? AND position >= ?",
@@ -307,8 +315,8 @@ def move_task(conn, task_id, direction):
         return False
     pos, done, parent_id = row
     new_pos = pos + direction
-    # Swap with the adjacent sibling: among top-level tasks of the same done-state,
-    # or among the same parent's subtasks (their done-state is irrelevant to order).
+    # Swap with the adjacent sibling of the same done-state — top-level tasks
+    # and subtasks alike never reorder across the active/done boundary.
     if parent_id is None:
         swap = conn.execute(
             "SELECT id FROM tasks WHERE position=? AND done=? AND parent_id IS NULL",
@@ -316,8 +324,8 @@ def move_task(conn, task_id, direction):
         ).fetchone()
     else:
         swap = conn.execute(
-            "SELECT id FROM tasks WHERE position=? AND parent_id=?",
-            (new_pos, parent_id),
+            "SELECT id FROM tasks WHERE position=? AND parent_id=? AND done=?",
+            (new_pos, parent_id, done),
         ).fetchone()
     if swap is None:
         return False
