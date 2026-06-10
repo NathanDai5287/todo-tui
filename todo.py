@@ -31,7 +31,7 @@ HELP_INPUT = [
 HELP_TASK = [
     ("↑↓", "nav"), ("shift+↑↓", "move"), ("space", "done"),
     ("tab", "status"), ("⏎", "notes"), ("shift+⏎", "subtask"), ("→", "links"),
-    ("c", "copy"), ("F2", "rename"), ("ctrl+⌫", "del"), ("⌫", "undo"),
+    ("c", "copy"), ("F2", "rename"), ("cmd+⌫", "del"), ("⌫", "undo"),
     ("q", "quit"),
 ]
 HELP_RENAME = [
@@ -41,7 +41,10 @@ HELP_NOTES_ITEMS = [
     ("⏎", "newline"), ("ctrl+/", "clear"),
     ("esc", "save & close"),
 ]
-HELP_LINKS_ITEMS = [("↑↓", "nav"), ("⏎/→", "open"), ("esc/←", "back")]
+HELP_LINKS_ITEMS = [
+    ("↑↓", "nav"), ("⏎/→", "open"), ("F2", "label"), ("esc/←", "back"),
+]
+HELP_LINK_LABEL_ITEMS = [("type", ""), ("⏎/esc", "save"), ("ctrl+w", "word")]
 
 INPUT_PREFIX = " + "
 INPUT_INDENT = "   "
@@ -49,10 +52,10 @@ INPUT_PLACEHOLDER = "New task..."
 
 TASK_PREFIX_LEN = 7  # " [x] · "
 TASK_INDENT = " " * TASK_PREFIX_LEN
-SUBTASK_PREFIX_LEN = 9  # "   [x]   " — indented two past a top-level task, no marker
+SUBTASK_PREFIX_LEN = 11  # "     [x]   " — indented four past a top-level task, no marker
 SUBTASK_INDENT = " " * SUBTASK_PREFIX_LEN
 TASK_STATUS_COL = 1  # column where a top-level "[x]" checkbox starts
-SUBTASK_STATUS_COL = 3  # ...and where an indented subtask's checkbox starts
+SUBTASK_STATUS_COL = 5  # ...and where an indented subtask's checkbox starts
 
 EDITOR_INDENT = "    "  # one indent level in the notes editor (Tab / Shift+Tab)
 
@@ -63,6 +66,9 @@ HEADING_PLAIN_LEAD = "──"  # heading lead-in for an unfocused panel
 
 F2_KEY = curses.KEY_F0 + 2
 CTRL_W = "\x17"
+# Ghostty's default super+backspace keybind sends NAK (Ctrl+U), so Cmd+Backspace
+# arrives as this byte with no terminal configuration needed.
+CMD_BACKSPACE = "\x15"
 CTRL_SLASH = "\x1f"  # Ctrl+/ sends US (0x1f) — clears the whole note in the editor
 
 STATUS_NONE = 0
@@ -86,6 +92,8 @@ LINK_SEL_BASE_PAIR = 8
 LINK_SEL_HOST_PAIR = 9
 LINK_SEL_ALT_PAIR = 10
 LINK_SEL_LAST_PAIR = 11
+# Subtle grey band marking the subitems of the currently selected parent task.
+SUBTASK_HILITE_PAIR = 12
 
 
 # --- Database ---
@@ -130,6 +138,16 @@ def db_connect():
             CREATE TABLE IF NOT EXISTS pastes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 content TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS link_labels (
+                task_id INTEGER NOT NULL,
+                target  TEXT NOT NULL,
+                label   TEXT NOT NULL,
+                PRIMARY KEY (task_id, target)
             )
             """
         )
@@ -180,18 +198,29 @@ def add_task(conn, title):
         )
 
 
-def add_subtask(conn, parent_id, title=""):
-    """Append a new subtask under parent_id and return its id. Subtasks are
-    ordered among siblings by position and start not-done."""
+def add_subtask(conn, parent_id, after_id=None, title=""):
+    """Insert a new subtask under parent_id and return its id. It is placed
+    directly after the sibling with id `after_id`, or at the front of the
+    sibling list when after_id is None (e.g. just below the parent task);
+    following siblings shift down to make room. Subtasks start not-done."""
     with conn:
-        max_pos = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) FROM tasks WHERE parent_id=?",
-            (parent_id,),
-        ).fetchone()[0]
+        if after_id is None:
+            pos = 0
+        else:
+            row = conn.execute(
+                "SELECT position FROM tasks WHERE id=? AND parent_id=?",
+                (after_id, parent_id),
+            ).fetchone()
+            pos = (row[0] + 1) if row else 0
+        conn.execute(
+            "UPDATE tasks SET position = position + 1 "
+            "WHERE parent_id=? AND position >= ?",
+            (parent_id, pos),
+        )
         cur = conn.execute(
             "INSERT INTO tasks (title, notes, position, done, parent_id) "
             "VALUES (?, '', ?, 0, ?)",
-            (title, max_pos + 1, parent_id),
+            (title, pos, parent_id),
         )
     return cur.lastrowid
 
@@ -228,6 +257,46 @@ def update_title(conn, task_id, title):
 def update_notes(conn, task_id, notes):
     with conn:
         conn.execute("UPDATE tasks SET notes=? WHERE id=?", (notes, task_id))
+
+
+def get_link_labels(conn, task_id):
+    """target -> label mapping for one task's links."""
+    return dict(
+        conn.execute(
+            "SELECT target, label FROM link_labels WHERE task_id=?", (task_id,)
+        )
+    )
+
+
+def set_link_label(conn, task_id, target, label):
+    """Set (or clear, when empty/whitespace) the label for one link of a task."""
+    label = label.strip()
+    with conn:
+        if label:
+            conn.execute(
+                "INSERT INTO link_labels (task_id, target, label) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT (task_id, target) DO UPDATE SET label=excluded.label",
+                (task_id, target, label),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM link_labels WHERE task_id=? AND target=?",
+                (task_id, target),
+            )
+
+
+def prune_link_labels(conn, keep_task_ids):
+    """Drop labels belonging to tasks that no longer exist anywhere (current
+    list or undo snapshots). Stale targets of live tasks are kept — they're
+    never surfaced once the link leaves the notes, and cost nothing."""
+    ids = set(keep_task_ids)
+    with conn:
+        for (tid,) in conn.execute(
+            "SELECT DISTINCT task_id FROM link_labels"
+        ).fetchall():
+            if tid not in ids:
+                conn.execute("DELETE FROM link_labels WHERE task_id=?", (tid,))
 
 
 def move_task(conn, task_id, direction):
@@ -267,10 +336,30 @@ def toggle_done(conn, task_id):
     pos, done, parent_id = row
     new_done = 1 - done
     if parent_id is not None:
-        # A subtask just flips in place — it never leaves its parent's group.
+        # A subtask stays under its parent, moving to the active/done boundary
+        # of its sibling list: completing one puts it at the top of the done
+        # block, reopening puts it at the bottom of the active block.
         with conn:
             conn.execute(
                 "UPDATE tasks SET done=? WHERE id=?", (new_done, task_id)
+            )
+            conn.execute(
+                "UPDATE tasks SET position = position - 1 "
+                "WHERE parent_id=? AND position > ?",
+                (parent_id, pos),
+            )
+            new_pos = conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE parent_id=? AND id != ? AND done=0",
+                (parent_id, task_id),
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE tasks SET position = position + 1 "
+                "WHERE parent_id=? AND id != ? AND position >= ?",
+                (parent_id, task_id, new_pos),
+            )
+            conn.execute(
+                "UPDATE tasks SET position=? WHERE id=?", (new_pos, task_id)
             )
         return
     with conn:
@@ -1153,11 +1242,12 @@ def editor_handle_key(buf, ch, width):
     """Apply one content/navigation keystroke to buf at the given wrap width.
 
     Handles printable input, arrows, Home/End, Backspace, Delete, newline and
-    Ctrl-W. Returns True if the key was consumed. Callers own Esc / Ctrl-C and
+    Ctrl-W / Cmd-Backspace word delete. Returns True if the key was consumed.
+    Callers own Esc / Ctrl-C and
     the Alt-Backspace (Esc-then-Backspace) word delete, since what "leaving the
     editor" means differs per mount."""
     lines = buf.lines
-    if ch == CTRL_W:
+    if ch == CTRL_W or ch == CMD_BACKSPACE:
         editor_word_delete_back(buf)
     elif ch == curses.KEY_UP:
         rows, cur_row, cur_col = editor_layout(lines, buf.cy, buf.cx, width)
@@ -1322,12 +1412,20 @@ def edit_notes(stdscr, conn, title, initial_text, status=STATUS_NONE):
         set_cursor(False)
 
 
-def pick_link(stdscr, title, links, status=STATUS_NONE):
+def pick_link(stdscr, conn, task_id, title, links, status=STATUS_NONE):
     """Modal list of links detected in a task. `links` is a list of
     (display, target) pairs. Up/down to navigate, enter/right to open the
-    selected link in the browser, esc/left to close."""
+    selected link in the browser, esc/left to close.
+
+    F2 edits a per-(task, link) label, persisted in link_labels: a labeled
+    link shows just its label, and the selected row's real URL is always
+    previewed dimmed at the bottom of the popup."""
     sel = 0
     scroll = 0
+    labels = get_link_labels(conn, task_id)
+    editing = False
+    edit_buf = []
+    edit_cursor = 0
     role_attr = {
         "scheme": curses.A_NORMAL,
         "host": curses.color_pair(LINK_HOST_COLOR_PAIR) | curses.A_BOLD,
@@ -1352,12 +1450,13 @@ def pick_link(stdscr, title, links, status=STATUS_NONE):
         stdscr.erase()
         draw_modal_header(stdscr, w, "links — " + title, status)
 
-        list_h = max(1, h - 2)
+        list_h = max(1, h - 3)  # one line reserved for the URL preview footer
         if sel < scroll:
             scroll = sel
         elif sel >= scroll + list_h:
             scroll = sel - list_h + 1
 
+        cursor_pos = None
         for i in range(list_h):
             idx = scroll + i
             if idx >= len(links):
@@ -1370,20 +1469,79 @@ def pick_link(stdscr, title, links, status=STATUS_NONE):
                 fill_line(stdscr, y, 0, w, "", sel_base)  # solid highlight bar
                 safe_addstr(stdscr, y, 1, "·", sel_base | curses.A_BOLD)
             x = 3
-            for text, role in link_spans(display, _is_http(target)):
-                if x >= w - 1:
-                    break
-                safe_addstr(stdscr, y, x, text, attrs[role])
-                x += len(text)
+            if selected_row and editing:
+                text = "".join(edit_buf)
+                safe_addstr(stdscr, y, x, text[: max(0, w - 1 - x)], sel_base)
+                cursor_pos = (y, min(x + edit_cursor, w - 1))
+            elif labels.get(target):
+                label_attr = (
+                    sel_base | curses.A_BOLD if selected_row else curses.A_NORMAL
+                )
+                safe_addstr(
+                    stdscr, y, x, labels[target][: max(0, w - 1 - x)], label_attr
+                )
+            else:
+                for text, role in link_spans(display, _is_http(target)):
+                    if x >= w - 1:
+                        break
+                    safe_addstr(stdscr, y, x, text, attrs[role])
+                    x += len(text)
 
-        render_help_bar(stdscr, h - 1, HELP_LINKS_ITEMS, w - 1)
+        # Footer: the real destination of the selected link, always visible.
+        if links:
+            safe_addstr(
+                stdscr, h - 2, 1, links[sel][0][: max(0, w - 2)], curses.A_DIM
+            )
+
+        help_items = HELP_LINK_LABEL_ITEMS if editing else HELP_LINKS_ITEMS
+        render_help_bar(stdscr, h - 1, help_items, w - 1)
+        if cursor_pos is not None:
+            try:
+                stdscr.move(cursor_pos[0], cursor_pos[1])
+            except curses.error:
+                pass
+        set_cursor(cursor_pos is not None)
         stdscr.refresh()
 
         ch = stdscr.get_wch()
         if ch == "\x03":
+            set_cursor(False)
             return
         if ch == "\x1b":
             ch = decode_escape(stdscr)
+
+        if editing:
+            if ch == "\n" or ch == "\r" or ch is ESC_BARE:
+                set_link_label(conn, task_id, links[sel][1], "".join(edit_buf))
+                labels = get_link_labels(conn, task_id)
+                editing = False
+                set_cursor(False)
+            elif ch in (CTRL_W, CMD_BACKSPACE, ESC_ALT_BACKSPACE):
+                edit_cursor = delete_word_back(edit_buf, edit_cursor)
+            elif ch == ESC_WORD_LEFT:
+                edit_cursor = word_left(edit_buf, edit_cursor)
+            elif ch == ESC_WORD_RIGHT:
+                edit_cursor = word_right(edit_buf, edit_cursor)
+            elif is_backspace(ch):
+                if edit_cursor > 0:
+                    del edit_buf[edit_cursor - 1]
+                    edit_cursor -= 1
+            elif ch == curses.KEY_DC:
+                if edit_cursor < len(edit_buf):
+                    del edit_buf[edit_cursor]
+            elif ch == curses.KEY_LEFT:
+                edit_cursor = max(0, edit_cursor - 1)
+            elif ch == curses.KEY_RIGHT:
+                edit_cursor = min(len(edit_buf), edit_cursor + 1)
+            elif ch == curses.KEY_HOME:
+                edit_cursor = 0
+            elif ch == curses.KEY_END:
+                edit_cursor = len(edit_buf)
+            elif isinstance(ch, str) and len(ch) == 1 and ch.isprintable():
+                edit_buf.insert(edit_cursor, ch)
+                edit_cursor += 1
+            continue
+
         if ch is ESC_BARE:
             return
         if ch in (curses.KEY_UP, "k"):
@@ -1396,6 +1554,10 @@ def pick_link(stdscr, title, links, status=STATUS_NONE):
             sel = len(links) - 1
         elif ch in ("\n", "\r", curses.KEY_RIGHT):
             open_link(links[sel][1])
+        elif ch == F2_KEY:
+            editing = True
+            edit_buf = list(labels.get(links[sel][1], ""))
+            edit_cursor = len(edit_buf)
         elif ch in (curses.KEY_LEFT, "q", "Q"):
             return
         elif ch == curses.KEY_RESIZE:
@@ -1448,7 +1610,7 @@ def build_render(tasks, w, rename_idx=None, rename_text=None, rename_cursor=0):
             if j > 0:
                 prefix = cont_indent
             elif is_sub:
-                prefix = "   " + checkbox + "   "  # no notes marker on subtasks
+                prefix = "     " + checkbox + "   "  # no notes marker on subtasks
             else:
                 marker = "·" if notes else " "
                 prefix = " " + checkbox + " " + marker + " "
@@ -1535,6 +1697,18 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 scroll = sel_last - task_area_h + 1
     scroll = max(0, min(scroll, max(0, len(rows) - task_area_h)))
 
+    # Lightly band the rest of the selected row's group (a parent task and its
+    # subitems) so the group reads as one unit. Works whether the parent or one
+    # of its subitems is selected; the selected row keeps its strong highlight.
+    hilite_group = set()
+    if selected > 0 and selected - 1 < len(tasks):
+        sel_tid, _t, _n, _d, _s, sel_parent = tasks[selected - 1]
+        group_root = sel_tid if sel_parent is None else sel_parent
+        hilite_group = {
+            j for j, t in enumerate(tasks)
+            if t[0] == group_root or t[5] == group_root
+        }
+
     sel_screen_first_row = None
     for i in range(task_area_h):
         ri = scroll + i
@@ -1552,6 +1726,9 @@ def render_main(stdscr, tasks, selected, scroll, input_buf, input_cursor,
                 attr = curses.A_BOLD
             else:
                 attr = curses.A_REVERSE
+        elif r["kind"] == "task" and r["task_idx"] in hilite_group:
+            # Keep done-dimming, add the grey band behind the group member.
+            attr = r["attr"] | curses.color_pair(SUBTASK_HILITE_PAIR)
         fill_line(stdscr, task_area_start + i, 0, w, r["text"], attr)
         status_cp = STATUS_COLOR_PAIR.get(r.get("status", STATUS_NONE), 0)
         if status_cp:
@@ -1675,6 +1852,7 @@ def run(stdscr):
     curses.init_pair(LINK_SEL_HOST_PAIR, pal["cyan"], sel_bg)
     curses.init_pair(LINK_SEL_ALT_PAIR, pal["magenta"], sel_bg)
     curses.init_pair(LINK_SEL_LAST_PAIR, pal["green"], sel_bg)
+    curses.init_pair(SUBTASK_HILITE_PAIR, -1, sel_bg)
     set_cursor(False)
     stdscr.keypad(True)
     set_kitty_keyboard(True)
@@ -1714,6 +1892,12 @@ def run(stdscr):
         for snap, _sel in undo_stack:
             keep |= referenced_paste_ids(r[2] for r in snap)
         prune_pastes(conn, keep)
+        # Same idea for link labels: a task's labels live as long as the task
+        # is reachable (current list or any undo snapshot).
+        keep_ids = {t[0] for t in tasks}
+        for snap, _sel in undo_stack:
+            keep_ids |= {r[0] for r in snap}
+        prune_link_labels(conn, keep_ids)
 
     def commit_rename():
         nonlocal renaming, rename_buf, rename_cursor, rename_target_id
@@ -1769,6 +1953,42 @@ def run(stdscr):
                 if ch == "\n" or ch == "\r" or ch is ESC_BARE:
                     commit_rename()
                     continue
+                if ch == ESC_SHIFT_ENTER:
+                    # Save the edit in progress, then open a fresh subtask in
+                    # edit mode right below it (under the same parent; a
+                    # top-level task gets its first subtask). If the edit was
+                    # an empty new subtask, commit drops it and we add nothing.
+                    target = rename_target_id
+                    commit_rename()
+                    row = next((t for t in tasks if t[0] == target), None)
+                    if row is not None:
+                        if row[5] is None:
+                            parent, after_id = row[0], None
+                        else:
+                            parent, after_id = row[5], row[0]
+                        push_undo()
+                        new_id = add_subtask(conn, parent, after_id)
+                        tasks = list_tasks(conn)
+                        new_idx = next(
+                            (i for i, t in enumerate(tasks) if t[0] == new_id),
+                            None,
+                        )
+                        if new_idx is not None:
+                            selected = new_idx + 1
+                        renaming = True
+                        rename_buf = []
+                        rename_cursor = 0
+                        rename_target_id = new_id
+                        rename_is_new = True
+                    continue
+                if ch == curses.KEY_UP:
+                    commit_rename()
+                    selected = max(0, selected - 1)
+                    continue
+                if ch == curses.KEY_DOWN:
+                    commit_rename()
+                    selected = min(len(tasks), selected + 1)
+                    continue
                 if ch == "\x03":
                     commit_rename()
                     break
@@ -1795,7 +2015,7 @@ def run(stdscr):
                             tasks = list_tasks(conn)
                             selected = 0 if not tasks else min(selected, len(tasks))
                     continue
-                if ch == CTRL_W or ch == ESC_ALT_BACKSPACE:
+                if ch in (CTRL_W, CMD_BACKSPACE, ESC_ALT_BACKSPACE):
                     rename_cursor = delete_word_back(rename_buf, rename_cursor)
                 elif ch == ESC_WORD_LEFT:
                     rename_cursor = word_left(rename_buf, rename_cursor)
@@ -1862,14 +2082,16 @@ def run(stdscr):
                         input_buf = []
                         input_cursor = 0
                 elif ch is ESC_BARE:
-                    # Move focus to the first task, like pressing Down once.
+                    # Clear the input and move focus to the first task.
+                    input_buf = []
+                    input_cursor = 0
                     if tasks:
                         selected = 1
                 elif ch == ESC_WORD_LEFT:
                     input_cursor = word_left(input_buf, input_cursor)
                 elif ch == ESC_WORD_RIGHT:
                     input_cursor = word_right(input_buf, input_cursor)
-                elif ch == CTRL_W or ch == ESC_ALT_BACKSPACE:
+                elif ch in (CTRL_W, CMD_BACKSPACE, ESC_ALT_BACKSPACE):
                     input_cursor = delete_word_back(input_buf, input_cursor)
                 elif is_backspace(ch):
                     if input_buf:
@@ -1916,14 +2138,24 @@ def run(stdscr):
                     push_undo()
                     if move_task(conn, tid, -1):
                         tasks = list_tasks(conn)
-                        selected -= 1
+                        # Follow the moved task: it can jump several display rows
+                        # when it crosses a task that carries its own subitems.
+                        new_idx = next(
+                            (i for i, t in enumerate(tasks) if t[0] == tid), None
+                        )
+                        if new_idx is not None:
+                            selected = new_idx + 1
                     else:
                         undo_stack.pop()
                 elif ch == curses.KEY_SF:
                     push_undo()
                     if move_task(conn, tid, 1):
                         tasks = list_tasks(conn)
-                        selected += 1
+                        new_idx = next(
+                            (i for i, t in enumerate(tasks) if t[0] == tid), None
+                        )
+                        if new_idx is not None:
+                            selected = new_idx + 1
                     else:
                         undo_stack.pop()
                 elif ch == " ":
@@ -1943,15 +2175,23 @@ def run(stdscr):
                     push_undo()
                     cycle_status(conn, tid, -1)
                     tasks = list_tasks(conn)
-                elif (ch == "\n" or ch == "\r") and parent_id is None:
-                    # Subtasks have no notes, so Enter only opens the editor for
-                    # top-level tasks.
-                    new = edit_notes(stdscr, conn, title, notes, status)
-                    if new is not None and new != notes:
-                        push_undo()
-                        update_notes(conn, tid, new)
-                        tasks = list_tasks(conn)
-                        prune_orphan_pastes()
+                elif ch == "\n" or ch == "\r":
+                    # Enter opens the notes editor. Subtasks have no notes of
+                    # their own, so on a subtask we edit its parent todo's notes.
+                    if parent_id is None:
+                        note_row = tasks[task_idx]
+                    else:
+                        note_row = next(
+                            (t for t in tasks if t[0] == parent_id), None
+                        )
+                    if note_row is not None:
+                        n_tid, n_title, n_notes, _d, n_status, _p = note_row
+                        new = edit_notes(stdscr, conn, n_title, n_notes, n_status)
+                        if new is not None and new != n_notes:
+                            push_undo()
+                            update_notes(conn, n_tid, new)
+                            tasks = list_tasks(conn)
+                            prune_orphan_pastes()
                 elif ch == "c" or ch == "C":
                     if notes:
                         copy_to_clipboard(expand_pastes(conn, notes))
@@ -1970,20 +2210,39 @@ def run(stdscr):
                             )
                             curses.napms(80)
                 elif ch == curses.KEY_RIGHT:
-                    links = find_links(expand_pastes(conn, notes), title)
-                    if links:
-                        pick_link(stdscr, title, links, status)
+                    # Like Enter, a subtask's links come from its parent todo.
+                    if parent_id is None:
+                        link_row = tasks[task_idx]
+                    else:
+                        link_row = next(
+                            (t for t in tasks if t[0] == parent_id), None
+                        )
+                    if link_row is not None:
+                        l_title, l_notes, l_status = (
+                            link_row[1], link_row[2], link_row[4]
+                        )
+                        links = find_links(expand_pastes(conn, l_notes), l_title)
+                        if links:
+                            pick_link(
+                                stdscr, conn, link_row[0],
+                                l_title, links, l_status,
+                            )
                 elif ch == F2_KEY:
                     renaming = True
                     rename_buf = list(title)
                     rename_cursor = len(rename_buf)
                     rename_target_id = tid
-                elif ch == ESC_CTRL_BACKSPACE or ch == curses.KEY_DC:
+                elif ch in (CMD_BACKSPACE, ESC_ALT_BACKSPACE, curses.KEY_DC):
                     push_undo()
+                    was_subitem = parent_id is not None
                     delete_task(conn, tid)
                     tasks = list_tasks(conn)
                     if not tasks:
                         selected = 0
+                    elif was_subitem:
+                        # Land on the line above the deleted subitem (its
+                        # sibling, or the parent task if it was the first child).
+                        selected = min(selected - 1, len(tasks))
                     else:
                         selected = min(selected, len(tasks))
                 elif is_backspace(ch):
@@ -1992,11 +2251,15 @@ def run(stdscr):
                         tasks = list_tasks(conn)
                         selected = max(0, min(sel, len(tasks)))
                 elif ch == ESC_SHIFT_ENTER:
-                    # Add a subtask: under this task, or as a sibling if this
-                    # row is already a subtask (single-level nesting).
-                    parent = parent_id if parent_id is not None else tid
+                    # Add a subtask directly below the current line: on a
+                    # top-level task it becomes that task's first subtask; on a
+                    # subtask, a sibling right after it (single-level nesting).
+                    if parent_id is None:
+                        parent, after_id = tid, None
+                    else:
+                        parent, after_id = parent_id, tid
                     push_undo()
-                    new_id = add_subtask(conn, parent)
+                    new_id = add_subtask(conn, parent, after_id)
                     tasks = list_tasks(conn)
                     new_idx = next(
                         (i for i, t in enumerate(tasks) if t[0] == new_id), None
